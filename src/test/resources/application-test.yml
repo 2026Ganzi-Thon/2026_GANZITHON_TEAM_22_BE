@@ -1,0 +1,16 @@
+spring:
+  datasource:
+    url: ${GANZI_TEST_DB_URL}
+    username: ${GANZI_TEST_DB_USERNAME}
+    password: ${GANZI_TEST_DB_PASSWORD}
+    driver-class-name: com.mysql.cj.jdbc.Driver
+  sql:
+    init:
+      mode: always
+ganzi:
+  chat:
+    enabled: false
+    memory:
+      archive-enabled: false
+  rate-limit:
+    enabled: false

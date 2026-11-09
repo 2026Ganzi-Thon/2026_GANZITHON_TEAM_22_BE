@@ -1,0 +1,16 @@
+# Explicit build-context allowlist: local credentials, databases, logs,
+# Gradle caches and previously built artifacts cannot enter the context.
+*
+!Dockerfile
+!gradlew
+!gradle.properties
+!settings.gradle
+!build.gradle
+!bootstrap.gradle
+!gradle/
+!gradle/wrapper/
+!gradle/wrapper/gradle-wrapper.jar
+!gradle/wrapper/gradle-wrapper.properties
+!src/
+!src/main/
+!src/main/**

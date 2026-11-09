@@ -1,0 +1,14 @@
+.gradle/
+.gradle-home/
+build/
+data/
+.idea/
+*.iml
+.env
+.env.*
+*.pem
+*.key
+*.p12
+*.pfx
+*.jks
+*.log

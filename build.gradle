@@ -1,0 +1,41 @@
+plugins {
+    id 'java'
+    id 'org.springframework.boot' version '3.5.16'
+}
+
+group = 'kr.ganzithon'
+version = '0.6.0-local'
+
+java { toolchain { languageVersion = JavaLanguageVersion.of(21) } }
+repositories { mavenCentral() }
+configurations { mockitoAgent }
+dependencies {
+    implementation platform('org.springframework.boot:spring-boot-dependencies:3.5.16')
+    implementation 'org.springframework.boot:spring-boot-starter-web'
+    implementation 'org.springframework.boot:spring-boot-starter-validation'
+    implementation 'org.springframework.boot:spring-boot-starter-jdbc'
+    runtimeOnly 'com.mysql:mysql-connector-j'
+    implementation 'org.flywaydb:flyway-core'
+    runtimeOnly 'org.flywaydb:flyway-mysql'
+    testImplementation platform('org.springframework.boot:spring-boot-dependencies:3.5.16')
+    testImplementation 'org.springframework.boot:spring-boot-starter-test'
+    mockitoAgent platform('org.springframework.boot:spring-boot-dependencies:3.5.16')
+    mockitoAgent('org.mockito:mockito-core') { transitive = false }
+    testRuntimeOnly 'org.junit.platform:junit-platform-launcher'
+}
+abstract class MockitoAgentArguments implements org.gradle.process.CommandLineArgumentProvider {
+    @org.gradle.api.tasks.Classpath
+    abstract org.gradle.api.file.ConfigurableFileCollection getAgentClasspath()
+
+    @Override Iterable<String> asArguments() {
+        return ["-javaagent:${agentClasspath.singleFile.absolutePath}"]
+    }
+}
+
+tasks.withType(Test).configureEach {
+    useJUnitPlatform()
+    def agent = objects.newInstance(MockitoAgentArguments)
+    agent.agentClasspath.from(configurations.mockitoAgent)
+    jvmArgumentProviders.add(agent)
+}
+tasks.withType(JavaCompile).configureEach { options.encoding = 'UTF-8' }

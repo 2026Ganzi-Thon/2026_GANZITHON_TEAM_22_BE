@@ -1,0 +1,51 @@
+# External integration environment. Never imports the workstation .env or local DB.
+spring:
+  lifecycle:
+    timeout-per-shutdown-phase: 20s
+  jdbc:
+    template:
+      query-timeout: 5s
+  datasource:
+    url: ${GANZI_DB_URL}
+    username: ${GANZI_DB_USERNAME}
+    password: ${GANZI_DB_PASSWORD}
+    hikari:
+      maximum-pool-size: 5
+      minimum-idle: 1
+      connection-timeout: 5000
+      validation-timeout: 3000
+      initialization-fail-timeout: 10000
+      connection-init-sql: "SET time_zone = '+00:00'"
+  sql:
+    init:
+      mode: never
+  flyway:
+    enabled: true
+    locations: classpath:db/migration
+    clean-disabled: true
+    baseline-on-migrate: false
+    validate-on-migrate: true
+server:
+  address: 0.0.0.0
+  port: ${PORT:8080}
+  forward-headers-strategy: none
+  shutdown: graceful
+  tomcat:
+    threads:
+      max: 50
+    max-swallow-size: 64KB
+    max-http-form-post-size: 64KB
+ganzi:
+  demo:
+    enabled: false
+  health:
+    check-database: true
+  cors:
+    allowed-origins: ${GANZI_ALLOWED_ORIGINS}
+  chat:
+    enabled: ${GANZI_CHAT_ENABLED:false}
+    budget:
+      scope: ${GANZI_CHAT_BUDGET_SCOPE:staging}
+      daily-usd: ${GANZI_CHAT_DAILY_USD:0.25}
+      monthly-usd: ${GANZI_CHAT_MONTHLY_USD:0.25}
+      user-daily-requests: ${GANZI_CHAT_USER_DAILY_REQUESTS:30}

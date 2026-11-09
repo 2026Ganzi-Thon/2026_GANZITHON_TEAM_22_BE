@@ -1,0 +1,16 @@
+spring:
+  config:
+    import: "optional:file:./.env[.properties]"
+  datasource:
+    url: ${GANZI_DEMO_DB_URL:jdbc:mysql://127.0.0.1:3306/ganzi_demo}
+    username: ${GANZI_DEMO_DB_USERNAME:ganzi_demo}
+    password: ${GANZI_DEMO_DB_PASSWORD:}
+  sql:
+    init:
+      mode: ${GANZI_DEMO_DB_INIT_MODE:always}
+server:
+  address: 127.0.0.1
+  port: ${GANZI_DEMO_PORT:8082}
+ganzi:
+  demo:
+    enabled: true

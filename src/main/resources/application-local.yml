@@ -1,0 +1,10 @@
+spring:
+  config:
+    import: "optional:file:./.env[.properties]"
+  datasource:
+    url: ${GANZI_DB_URL:jdbc:mysql://127.0.0.1:3306/ganzi}
+    username: ${GANZI_DB_USERNAME:ganzi}
+    password: ${GANZI_DB_PASSWORD:}
+  sql:
+    init:
+      mode: ${GANZI_DB_INIT_MODE:always}
