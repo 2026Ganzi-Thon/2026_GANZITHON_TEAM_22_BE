@@ -1,0 +1,70 @@
+name: haeboyang
+
+services:
+  api:
+    image: ${HAEBOYANG_API_IMAGE:?Set the backend image in .env}
+    restart: unless-stopped
+    mem_limit: 900m
+    stop_grace_period: 30s
+    depends_on:
+      mysql:
+        condition: service_healthy
+    env_file:
+      - path: ./.env.api
+        format: raw
+    environment:
+      SPRING_PROFILES_ACTIVE: staging
+      PORT: "8080"
+      SERVER_FORWARD_HEADERS_STRATEGY: native
+      GANZI_DB_URL: "jdbc:mysql://mysql:3306/haeboyang?sslMode=REQUIRED"
+      GANZI_DB_USERNAME: haeboyang
+      GANZI_DB_PASSWORD: ${MYSQL_PASSWORD:?Set MYSQL_PASSWORD in .env}
+    logging:
+      driver: local
+
+  mysql:
+    image: mysql:8.4
+    restart: unless-stopped
+    mem_limit: 640m
+    command: [--innodb-buffer-pool-size=128M, --max-connections=30]
+    environment:
+      MYSQL_DATABASE: haeboyang
+      MYSQL_USER: haeboyang
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD:?Set MYSQL_PASSWORD in .env}
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:?Set MYSQL_ROOT_PASSWORD in .env}
+    volumes:
+      - mysql_data:/var/lib/mysql
+    healthcheck:
+      test: [CMD, mysqladmin, ping, -h, 127.0.0.1, --silent]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+      start_period: 30s
+    logging:
+      driver: local
+
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    mem_limit: 128m
+    environment:
+      HAEBOYANG_API_HOSTNAME: ${HAEBOYANG_API_HOSTNAME:?Set the API hostname in .env}
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - type: bind
+        source: ./Caddyfile
+        target: /etc/caddy/Caddyfile
+        read_only: true
+        bind:
+          create_host_path: false
+      - caddy_data:/data
+      - caddy_config:/config
+    logging:
+      driver: local
+
+volumes:
+  mysql_data:
+  caddy_data:
+  caddy_config:

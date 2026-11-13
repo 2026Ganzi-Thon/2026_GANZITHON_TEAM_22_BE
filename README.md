@@ -25,6 +25,8 @@ Windows에서 Node.js와 MySQL 8을 설치한 뒤 `node scripts/verify-local.mjs
 
 ## AWS 배포 시 설정
 
+시드니 리전의 EC2·RDS에 배포하는 절차와 설정은 [EC2 배포 가이드](deploy/aws-ec2/README.md)에 있습니다.
+
 `docker build -t haeboyang-backend .`로 Java 21 컨테이너를 만들 수 있습니다. 이미지 기본 프로필은 `staging`, 기본 포트는 `8080`입니다. 이 프로필은 외부 MySQL을 사용하고 `/health`에서 DB 연결을 확인합니다. 팀의 AWS 실행 서비스와 데이터베이스가 정해지면 아래 값을 실행 환경에서 주입합니다.
 
 | 환경변수 | 설정 내용 |

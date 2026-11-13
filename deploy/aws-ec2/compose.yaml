@@ -1,0 +1,49 @@
+name: haeboyang
+
+services:
+  api:
+    image: ${HAEBOYANG_API_IMAGE:?Set the backend image in .env}
+    restart: unless-stopped
+    mem_limit: 1400m
+    stop_grace_period: 30s
+    env_file:
+      - path: ./.env.api
+        format: raw
+    environment:
+      SPRING_PROFILES_ACTIVE: staging
+      PORT: "8080"
+      # Caddy is the public entry point on this Compose network.
+      SERVER_FORWARD_HEADERS_STRATEGY: native
+    volumes:
+      - type: bind
+        source: ./rds-truststore.p12
+        target: /etc/haeboyang/rds-truststore.p12
+        read_only: true
+        bind:
+          create_host_path: false
+    logging:
+      driver: local
+
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    environment:
+      HAEBOYANG_API_HOSTNAME: ${HAEBOYANG_API_HOSTNAME:?Set the API hostname in .env}
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - type: bind
+        source: ./Caddyfile
+        target: /etc/caddy/Caddyfile
+        read_only: true
+        bind:
+          create_host_path: false
+      - caddy_data:/data
+      - caddy_config:/config
+    logging:
+      driver: local
+
+volumes:
+  caddy_data:
+  caddy_config:
