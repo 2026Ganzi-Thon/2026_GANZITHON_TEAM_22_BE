@@ -940,7 +940,7 @@
                 "SAD"
               ]
             },
-            "description": "생략하면 세 캐릭터를 모두 지정한다. 응답 발화 수는 달라질 수 있다."
+            "description": "발화할 수 있는 캐릭터 후보. 생략하면 세 캐릭터가 후보가 된다. 서버는 기본적으로 메시지 의도에 따라 후보 중 한 캐릭터를 고를 수 있다. 실제 발화자는 응답의 utterances에서 확인한다."
           }
         },
         "required": [
@@ -2777,7 +2777,7 @@
           "chat"
         ],
         "summary": "캐릭터 대화 한 턴 생성",
-        "description": "저장이 완료된 성공·실패 대화를 서버에 보존한다. 원문은 60일간 보관한 뒤 gzip으로 무손실 압축하며 자동 삭제하지 않는다. 동일 clientRequestId와 동일 입력의 저장된 결과는 서버 재시작·압축 뒤에도 모델 재호출 없이 반환한다. 동일 유료 요청의 예약이 5분 이내의 진행 중 상태면 다른 서버 프로세스에서도 409 REQUEST_IN_PROGRESS다. 완료 결과가 생기면 동시 재시도에도 그 결과를 반환한다. 이미 승인된 ID에서 더 이상 진행 중인 예약이나 결과를 찾지 못하면 새 AI 호출이나 대화 내역 생성 없이 200 FAILED CHAT_RESULT_UNAVAILABLE을 반환한다. 오래된 미정산 예약은 UNKNOWN으로 정리하며 예약 금액을 보수적으로 사용량에 유지한다. 대화 결과 저장과 사용량 정산은 한 트랜잭션에서 처리한다. 저장 또는 정산에 실패하면 각각 200 FAILED CHAT_MEMORY_WRITE_FAILED 또는 AI_USAGE_RECORD_FAILED를 반환한다. HTTP 409 코드는 CLIENT_REQUEST_ID_REUSED, REQUEST_IN_PROGRESS, CHAT_IN_PROGRESS, INVALID_PREVIOUS_EXCHANGE, INVALID_STUDY_STATE다. HTTP 429는 CHAT_RATE_LIMITED(사용자별 최근 60초에 10건, Retry-After 60) 또는 공통 요청 제한 RATE_LIMITED다. AI_MODEL_PRICE_NOT_CONFIGURED, AI_REQUEST_TOO_LARGE, AI_BUDGET_EXCEEDED, AI_DAILY_USAGE_EXCEEDED 등 AI 설정·과금 실패와 제공자 오류·응답 생성 중 공부방 종료는 200 FAILED의 failureCode다. 컨트롤러의 일반 요청 검증 실패는 별도 HTTP 400이다. HTTP 503은 CHAT_NOT_CONFIGURED, CHAT_CAPACITY_REACHED 또는 CHAT_HISTORY_UNAVAILABLE이다. 앱의 사용량 한도와 제공자 계정의 실제 잔액은 다르다.",
+        "description": "저장이 완료된 성공·실패 대화를 서버에 보존한다. 원문은 60일간 보관한 뒤 gzip으로 무손실 압축하며 자동 삭제하지 않는다. 동일 clientRequestId와 동일 입력의 저장된 결과는 서버 재시작·압축 뒤에도 모델 재호출 없이 반환한다. 동일 유료 요청의 예약이 5분 이내의 진행 중 상태면 다른 서버 프로세스에서도 409 REQUEST_IN_PROGRESS다. 완료 결과가 생기면 동시 재시도에도 그 결과를 반환한다. 이미 승인된 ID에서 더 이상 진행 중인 예약이나 결과를 찾지 못하면 새 AI 호출이나 대화 내역 생성 없이 200 FAILED CHAT_RESULT_UNAVAILABLE을 반환한다. 오래된 미정산 예약은 UNKNOWN으로 정리하며 예약 금액을 보수적으로 사용량에 유지한다. 대화 결과 저장과 사용량 정산은 한 트랜잭션에서 처리한다. 저장 또는 정산에 실패하면 각각 200 FAILED CHAT_MEMORY_WRITE_FAILED 또는 AI_USAGE_RECORD_FAILED를 반환한다. HTTP 409 코드는 CLIENT_REQUEST_ID_REUSED, REQUEST_IN_PROGRESS, CHAT_IN_PROGRESS, INVALID_PREVIOUS_EXCHANGE, INVALID_STUDY_STATE다. HTTP 429는 CHAT_RATE_LIMITED(사용자별 최근 60초에 10건, Retry-After 60) 또는 공통 요청 제한 RATE_LIMITED다. AI_MODEL_PRICE_NOT_CONFIGURED, AI_REQUEST_TOO_LARGE, AI_BUDGET_EXCEEDED, AI_DAILY_USAGE_EXCEEDED 등 AI 설정·과금 실패와 제공자 오류·응답 생성 중 공부방 종료는 200 FAILED의 failureCode다. 컨트롤러의 일반 요청 검증 실패는 별도 HTTP 400이다. INVALID_PREVIOUS_EXCHANGE를 받으면 입력을 보존하고 사용자 재전송 때 previousRequestId를 생략한다. HTTP 503은 CHAT_NOT_CONFIGURED, CHAT_CAPACITY_REACHED 또는 CHAT_HISTORY_UNAVAILABLE이다. 저장된 결과의 손상이 확인되면 CHAT_HISTORY_UNAVAILABLE의 retryable은 false이며, 일시적인 저장소 읽기 실패에는 true를 반환한다. 앱의 사용량 한도와 제공자 계정의 실제 잔액은 다르다.",
         "requestBody": {
           "required": true,
           "content": {
@@ -2834,7 +2834,7 @@
           "chat"
         ],
         "summary": "요청 ID로 대화 결과 복구",
-        "description": "본인 요청 한 건을 찾는다. 저장된 성공·실패 결과는 서버 재시작과 gzip 압축 뒤에도 복구한다. 유료 요청이 아직 처리 중이거나 완료 결과가 저장되지 않았다면 items=[]다. 저장 내역 손상·읽기 실패는 503 CHAT_HISTORY_UNAVAILABLE이다.",
+        "description": "본인 요청 한 건을 찾는다. 저장된 성공·실패 결과는 서버 재시작과 gzip 압축 뒤에도 복구한다. 이 서버에서 처리 중이면 items에 PROCESSING이 들어간다. 이 서버에 진행 정보가 없고 완료 결과가 저장되지 않았다면 items=[]다. 저장된 결과의 손상이 확인되면 503 CHAT_HISTORY_UNAVAILABLE과 retryable=false를 반환한다. 일시적인 저장소 읽기 실패는 같은 코드와 retryable=true를 반환한다.",
         "parameters": [
           {
             "name": "clientRequestId",
@@ -2885,7 +2885,7 @@
           "chat"
         ],
         "summary": "내 캐릭터 대화 내역 조회",
-        "description": "본인의 완료된 성공·실패 대화를 최신순으로 페이지 조회한다. 같은 공부방과 이전 날짜의 대화를 포함하며 gzip 압축된 대화도 투명하게 복원한다. 일부 기록의 저장 본문이 손상되면 그 항목은 건너뛰고 정상 항목을 계속 반환한다. AI 문맥에는 성공한 대화만 사용한다. 다른 사용자의 기록은 노출하지 않는다. 잘못된 커서는 400, 조회 자체가 실패하면 503 CHAT_HISTORY_UNAVAILABLE이다.",
+        "description": "본인의 완료된 성공·실패 대화를 최신순으로 페이지 조회한다. 같은 공부방과 이전 날짜의 대화를 포함하며 gzip 압축된 대화도 투명하게 복원한다. 일부 기록의 저장 본문이 손상되면 그 항목은 건너뛰고 정상 항목을 계속 반환한다. AI 문맥에는 성공한 대화만 사용한다. 다른 사용자의 기록은 노출하지 않는다. 잘못된 커서는 400이다. 저장소 연결 실패 또는 일시적인 DB 조회 실패는 503 CHAT_HISTORY_UNAVAILABLE이며 retryable=true다.",
         "parameters": [
           {
             "name": "limit",

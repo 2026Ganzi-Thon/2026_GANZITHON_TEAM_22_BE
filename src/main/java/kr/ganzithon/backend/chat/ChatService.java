@@ -42,6 +42,7 @@ public class ChatService {
     private final Map<Key, Entry> entries = new LinkedHashMap<>();
     private final Map<UUID, Key> inFlight = new HashMap<>();
     private final Duration responseDeadline;
+    private final boolean intentRoutingEnabled;
     private long completionOrder;
 
     private static final class Entry {
@@ -70,7 +71,8 @@ public class ChatService {
     @Autowired
     public ChatService(JdbcTemplate jdbc, Clock clock, ObjectProvider<ChatProvider> provider,
                        ChatBudgetService budget, ChatMemoryService memory, TransactionTemplate transactions,
-                       @Value("${ganzi.chat.response-deadline-seconds:30}") long responseDeadlineSeconds) {
+                       @Value("${ganzi.chat.response-deadline-seconds:30}") long responseDeadlineSeconds,
+                       @Value("${ganzi.chat.intent-routing-enabled:true}") boolean intentRoutingEnabled) {
         this.jdbc = new PortableJdbc(jdbc);
         this.clock = clock;
         this.provider = provider;
@@ -81,6 +83,13 @@ public class ChatService {
             throw new IllegalArgumentException("Chat response deadline must be 1 to 120 seconds");
         }
         this.responseDeadline = Duration.ofSeconds(responseDeadlineSeconds);
+        this.intentRoutingEnabled = intentRoutingEnabled;
+    }
+
+    public ChatService(JdbcTemplate jdbc, Clock clock, ObjectProvider<ChatProvider> provider,
+                       ChatBudgetService budget, ChatMemoryService memory, TransactionTemplate transactions,
+                       long responseDeadlineSeconds) {
+        this(jdbc, clock, provider, budget, memory, transactions, responseDeadlineSeconds, true);
     }
 
     // Existing unmetered test providers do not create external paid requests.
@@ -177,18 +186,22 @@ public class ChatService {
         ChatProvider.Usage usage = null;
         boolean chargeableUnknown = false;
         try {
-            ChatProvider.CostQuote quote = model.quote(request.content(), previousUserContent,
-                    previousAssistantContent, request.characterKeys(), studyState, memoryContext);
+            List<String> candidates = request.characterKeys();
+            List<String> speakers = intentRoutingEnabled
+                ? CharacterIntentRouter.select(request.content(), candidates) : candidates;
+            ChatProvider.Turn turn = new ChatProvider.Turn(request.content(), previousUserContent,
+                previousAssistantContent, speakers, studyState, memoryContext,
+                intentRoutingEnabled && speakers.size() == 1);
+            ChatProvider.CostQuote quote = model.quote(turn);
             if (quote != null) {
                 if (budget == null) throw new IllegalStateException("Missing AI budget service");
                 reservation = budget.reserve(userId, request.clientRequestId(), fingerprint(request), quote);
                 // From this point an interrupted call may still be billed upstream.
                 chargeableUnknown = true;
             }
-            ChatProvider.Reply reply = model.generate(request.content(), previousUserContent,
-                    previousAssistantContent, request.characterKeys(), studyState, memoryContext);
+            ChatProvider.Reply reply = model.generate(turn);
             usage = reply.usage();
-            utterances = validated(reply, request.characterKeys());
+            utterances = validated(reply, speakers);
         } catch (ChatProviderException ex) {
             failureCode = ex.code();
             usage = ex.usage();

@@ -146,6 +146,7 @@ class ChatMemoryIntegrationTest {
         ApiException error = assertThrows(ApiException.class, () -> memory.find(owner, damaged.clientRequestId()));
         assertEquals("CHAT_HISTORY_UNAVAILABLE", error.code());
         assertEquals(503, error.status());
+        assertFalse(error.retryable());
         assertEquals("tampered", jdbc.queryForObject("SELECT raw_payload FROM chat_memory WHERE id=?", String.class, damagedExchange.id().toString()));
         assertNull(jdbc.queryForObject("SELECT compressed_payload FROM chat_memory WHERE id=?", byte[].class, damagedExchange.id().toString()));
     }

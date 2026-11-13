@@ -6,6 +6,16 @@ import java.util.List;
 public interface ChatProvider {
     default void ensureConfigured() { }
 
+    default Reply generate(Turn turn) {
+        return generate(turn.userContent(), turn.previousUserContent(), turn.previousAssistantContent(),
+            turn.characterKeys(), turn.studyState(), turn.memoryContext());
+    }
+
+    default CostQuote quote(Turn turn) {
+        return quote(turn.userContent(), turn.previousUserContent(), turn.previousAssistantContent(),
+            turn.characterKeys(), turn.studyState(), turn.memoryContext());
+    }
+
     Reply generate(String userContent, String previousUserContent,
                    String previousAssistantContent, List<String> characterKeys);
 
@@ -40,6 +50,9 @@ public interface ChatProvider {
         return quote(userContent, previousUserContent, previousAssistantContent, characterKeys, studyState);
     }
 
+    /** The same server-selected generation input is used for estimation and the paid call. */
+    record Turn(String userContent, String previousUserContent, String previousAssistantContent,
+                List<String> characterKeys, String studyState, String memoryContext, boolean focusedPrompt) {}
     record Utterance(String characterKey, String content) {}
     record Usage(long inputTokens, long cachedInputTokens, long outputTokens) {}
     record CostQuote(String model, long maxInputTokens, int maxOutputTokens) {}

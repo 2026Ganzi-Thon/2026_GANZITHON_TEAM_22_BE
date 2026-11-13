@@ -33,23 +33,27 @@ public final class OpenAiChatProvider implements ChatProvider {
     private static final URI RESPONSES_URI = URI.create("https://api.openai.com/v1/responses");
     private static final Set<String> CHARACTER_KEYS = Set.of("ANGRY", "JOY", "SAD");
     private static final Set<String> STUDY_STATES = Set.of("HOME", "STUDYING", "PAUSED");
-    private static final Set<String> SUPPORTED_MODELS = Set.of("gpt-6-luna", "gpt-6.1-terra");
+    private static final String SOL = "gpt-6.1-sol";
+    private static final Set<String> SUPPORTED_MODELS = Set.of(SOL, "gpt-6-luna", "gpt-6.1-terra");
+    private static final Set<String> THINKING_EFFORTS = Set.of("low", "medium", "high", "xhigh", "max");
     private static final int MAX_REQUEST_BYTES = 65_536;
     private final ObjectMapper mapper;
     private final HttpClient client;
     private final URI uri;
     private final String apiKey;
     private final String model;
+    private final String reasoningEffort;
     private final int timeoutSeconds;
     private final int maxOutputTokens;
 
     @Autowired
     public OpenAiChatProvider(ObjectMapper mapper,
                               @Value("${ganzi.openai.api-key:}") String apiKey,
-                              @Value("${ganzi.openai.model:gpt-6-luna}") String model,
+                              @Value("${ganzi.openai.model:gpt-6.1-sol}") String model,
                               @Value("${ganzi.openai.timeout-seconds:20}") int timeoutSeconds,
-                              @Value("${ganzi.openai.max-output-tokens:1024}") int maxOutputTokens) {
-        this(mapper, apiKey, model, timeoutSeconds, maxOutputTokens, RESPONSES_URI,
+                              @Value("${ganzi.openai.max-output-tokens:2048}") int maxOutputTokens,
+                              @Value("${ganzi.openai.reasoning-effort:}") String reasoningEffort) {
+        this(mapper, apiKey, model, timeoutSeconds, maxOutputTokens, reasoningEffort, RESPONSES_URI,
             HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(5))
                 .followRedirects(HttpClient.Redirect.NEVER).build());
     }
@@ -57,9 +61,17 @@ public final class OpenAiChatProvider implements ChatProvider {
     // Only tests in this package can route synthetic requests to a loopback server.
     OpenAiChatProvider(ObjectMapper mapper, String apiKey, String model,
                        int timeoutSeconds, int maxOutputTokens, URI uri, HttpClient client) {
+        this(mapper, apiKey, model, timeoutSeconds, maxOutputTokens, "", uri, client);
+    }
+
+    OpenAiChatProvider(ObjectMapper mapper, String apiKey, String model,
+                       int timeoutSeconds, int maxOutputTokens, String reasoningEffort,
+                       URI uri, HttpClient client) {
         this.mapper = mapper;
         this.apiKey = apiKey;
         this.model = model;
+        this.reasoningEffort = reasoningEffort == null || reasoningEffort.isBlank()
+            ? (SOL.equals(model) ? "medium" : "none") : reasoningEffort;
         this.timeoutSeconds = timeoutSeconds;
         this.maxOutputTokens = maxOutputTokens;
         this.uri = uri;
@@ -70,7 +82,9 @@ public final class OpenAiChatProvider implements ChatProvider {
     public void ensureConfigured() {
         if (apiKey == null || apiKey.isBlank() || !SUPPORTED_MODELS.contains(model)
             || timeoutSeconds < 1 || timeoutSeconds > 30
-            || maxOutputTokens < 128 || maxOutputTokens > 2048) {
+            || maxOutputTokens < 128 || maxOutputTokens > 2048
+            || !(THINKING_EFFORTS.contains(reasoningEffort)
+                || (!SOL.equals(model) && "none".equals(reasoningEffort)))) {
             throw new ApiException(503, "CHAT_NOT_CONFIGURED", "대화 서비스 설정이 완료되지 않았습니다.");
         }
     }
@@ -92,8 +106,13 @@ public final class OpenAiChatProvider implements ChatProvider {
     public CostQuote quote(String userContent, String previousUserContent,
                           String previousAssistantContent, List<String> characterKeys,
                           String studyState, String memoryContext) {
-        byte[] body = payload(userContent, previousUserContent, previousAssistantContent,
-            characterKeys, studyState, memoryContext);
+        return quote(new Turn(userContent, previousUserContent, previousAssistantContent,
+            characterKeys, studyState, memoryContext, false));
+    }
+
+    @Override
+    public CostQuote quote(Turn turn) {
+        byte[] body = payload(turn);
         // UTF-8 request bytes plus fixed margin conservatively bound token count, including schema.
         // The same payload builder is used by generate; no cache discount is assumed.
         return new CostQuote(model, (long) body.length + 4096L, maxOutputTokens);
@@ -116,8 +135,13 @@ public final class OpenAiChatProvider implements ChatProvider {
     public Reply generate(String userContent, String previousUserContent,
                           String previousAssistantContent, List<String> characterKeys,
                           String studyState, String memoryContext) {
-        byte[] body = payload(userContent, previousUserContent, previousAssistantContent,
-            characterKeys, studyState, memoryContext);
+        return generate(new Turn(userContent, previousUserContent, previousAssistantContent,
+            characterKeys, studyState, memoryContext, false));
+    }
+
+    @Override
+    public Reply generate(Turn turn) {
+        byte[] body = payload(turn);
         HttpRequest request = HttpRequest.newBuilder(uri)
             .timeout(Duration.ofSeconds(timeoutSeconds))
             .header("Authorization", "Bearer " + apiKey)
@@ -129,7 +153,7 @@ public final class OpenAiChatProvider implements ChatProvider {
         try {
             HttpResponse<String> response = pending.get(timeoutSeconds, TimeUnit.SECONDS);
             if (response.statusCode() != 200) throw httpError(response.statusCode(), response.body());
-            return parseSuccess(response.body(), characterKeys);
+            return parseSuccess(response.body(), turn.characterKeys());
         } catch (TimeoutException ex) {
             pending.cancel(true);
             throw failure("AI_PROVIDER_FAILED", true, null);
@@ -142,22 +166,23 @@ public final class OpenAiChatProvider implements ChatProvider {
         }
     }
 
-    private byte[] payload(String userContent, String previousUserContent,
-                           String previousAssistantContent, List<String> characterKeys,
-                           String studyState, String memoryContext) {
+    private byte[] payload(Turn turn) {
         ensureConfigured();
-        validateInput(userContent, previousUserContent, previousAssistantContent,
-            characterKeys, studyState);
+        List<String> characterKeys = turn.characterKeys();
+        String memoryContext = turn.memoryContext();
+        validateInput(turn.userContent(), turn.previousUserContent(), turn.previousAssistantContent(),
+            characterKeys, turn.studyState());
         if (memoryContext != null && codePoints(memoryContext) > 6000) {
             throw new ApiException(400, "VALIDATION_FAILED", "과거 대화 문맥이 너무 깁니다.");
         }
         try {
             Map<String, Object> conversation = new LinkedHashMap<>();
-            conversation.put("currentUserContent", userContent);
-            conversation.put("previousUserContent", previousUserContent == null ? "" : previousUserContent);
-            conversation.put("previousAssistantContent", previousAssistantContent == null ? "" : previousAssistantContent);
+            conversation.put("currentUserContent", turn.userContent());
+            conversation.put("previousUserContent", turn.previousUserContent() == null ? "" : turn.previousUserContent());
+            conversation.put("previousAssistantContent",
+                turn.previousAssistantContent() == null ? "" : turn.previousAssistantContent());
             conversation.put("characterKeys", characterKeys);
-            conversation.put("serverStudyState", studyState);
+            conversation.put("serverStudyState", turn.studyState());
             conversation.put("memoryContext", memoryContext == null ? "" : memoryContext);
             Map<String, Object> line = new LinkedHashMap<>();
             line.put("type", "object");
@@ -174,11 +199,13 @@ public final class OpenAiChatProvider implements ChatProvider {
             schema.put("additionalProperties", false);
             Map<String, Object> request = new LinkedHashMap<>();
             request.put("model", model);
-            request.put("instructions", CharacterPrompt.systemPrompt());
+            request.put("instructions", turn.focusedPrompt() && characterKeys.size() == 1
+                ? CharacterPrompt.focusedPrompt(characterKeys.getFirst()) : CharacterPrompt.systemPrompt());
             request.put("input", mapper.writeValueAsString(conversation));
             request.put("store", false);
             request.put("service_tier", "default");
-            request.put("reasoning", Map.of("effort", "none"));
+            request.put("reasoning", "none".equals(reasoningEffort)
+                ? Map.of("effort", "none") : Map.of("mode", "standard", "effort", reasoningEffort));
             request.put("max_output_tokens", maxOutputTokens);
             request.put("text", Map.of("format", Map.of(
                 "type", "json_schema", "name", "character_dialogue",

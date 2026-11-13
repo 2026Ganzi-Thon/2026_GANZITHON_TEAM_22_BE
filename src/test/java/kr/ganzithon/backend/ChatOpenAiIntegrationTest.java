@@ -64,6 +64,8 @@ class ChatOpenAiIntegrationTest {
     void resetProvider() {
         provider.calls.set(0);
         provider.observedStudyState.set(null);
+        provider.quotedTurn.set(null);
+        provider.generatedTurn.set(null);
     }
 
     @AfterEach
@@ -90,9 +92,9 @@ class ChatOpenAiIntegrationTest {
         assertEquals(20, usage.path("daily").path("cachedInputTokens").asInt());
         assertEquals(30, usage.path("daily").path("outputTokens").asInt());
         assertEquals(0, usage.path("daily").path("estimatedUsd").decimalValue()
-                .compareTo(new BigDecimal("0.000040000")));
+                .compareTo(new BigDecimal("0.000800000")));
         assertEquals(0, usage.path("daily").path("reservedUsd").decimalValue().signum());
-        assertEquals(Long.valueOf(314_000L), jdbc.queryForObject("SELECT reserved_nano_usd FROM chat_usage_events "
+        assertEquals(Long.valueOf(6_280_000L), jdbc.queryForObject("SELECT reserved_nano_usd FROM chat_usage_events "
                 + "WHERE scope=? AND client_request_id=?", Long.class, SCOPE, firstId.toString()));
 
         JsonNode replay = exchange(owner.token(), firstId, "책을 펴 볼게요");
@@ -113,6 +115,28 @@ class ChatOpenAiIntegrationTest {
         Guest other = guest();
         assertEquals(0, usage(other.token()).path("daily").path("requests").asInt());
         assertTrue(recover(other.token(), firstId).path("items").isEmpty());
+    }
+
+    @Test
+    void defaultRoutingUsesOneMeteredCallAndCanBeReplayedWithTheOriginalCandidates() throws Exception {
+        Guest owner = guest();
+        UUID requestId = UUID.randomUUID();
+        Map<String, Object> payload = Map.of("clientRequestId", requestId, "content", "슬픔아, 오늘 좀 속상했어.");
+
+        JsonNode reply = exchange(owner.token(), payload);
+        assertEquals("SUCCEEDED", reply.path("status").asText());
+        assertEquals("SAD", reply.path("utterances").get(0).path("characterKey").asText());
+        ChatProvider.Turn sent = provider.generatedTurn.get();
+        assertTrue(sent.focusedPrompt());
+        assertEquals(List.of("SAD"), sent.characterKeys());
+        assertEquals(provider.quotedTurn.get(), sent);
+        assertEquals(1, provider.calls.get());
+        assertEquals(1, usage(owner.token()).path("daily").path("requests").asInt());
+
+        assertEquals(reply, exchange(owner.token(), payload));
+        assertEquals(reply.path("id").asText(), recover(owner.token(), requestId)
+            .path("items").get(0).path("id").asText());
+        assertEquals(1, provider.calls.get());
     }
 
     @Test
@@ -181,6 +205,10 @@ class ChatOpenAiIntegrationTest {
         payload.put("content", content);
         payload.put("characterKeys", List.of("JOY"));
         if (studySessionId != null) payload.put("studySessionId", studySessionId.toString());
+        return exchange(token, payload);
+    }
+
+    private JsonNode exchange(String token, Map<String, Object> payload) throws Exception {
         String body = mapper.writeValueAsString(payload);
         return mapper.readTree(mvc.perform(post("/api/v1/chat/exchanges")
                         .header("Authorization", "Bearer " + token)
@@ -211,11 +239,25 @@ class ChatOpenAiIntegrationTest {
     static class FakeMeteredProvider implements ChatProvider {
         final AtomicInteger calls = new AtomicInteger();
         final AtomicReference<String> observedStudyState = new AtomicReference<>();
+        final AtomicReference<Turn> quotedTurn = new AtomicReference<>();
+        final AtomicReference<Turn> generatedTurn = new AtomicReference<>();
+
+        @Override
+        public CostQuote quote(Turn turn) {
+            quotedTurn.set(turn);
+            return ChatProvider.super.quote(turn);
+        }
+
+        @Override
+        public Reply generate(Turn turn) {
+            generatedTurn.set(turn);
+            return ChatProvider.super.generate(turn);
+        }
 
         @Override
         public CostQuote quote(String content, String priorUser, String priorAssistant,
                                List<String> characterKeys) {
-            return new CostQuote("gpt-6-luna", 1000, 128);
+            return new CostQuote("gpt-6.1-sol", 1000, 128);
         }
 
         @Override
@@ -225,7 +267,7 @@ class ChatOpenAiIntegrationTest {
             if (content.equals("credit_exhausted")) {
                 throw new ChatProviderException("AI_CREDIT_EXHAUSTED", false, null);
             }
-            return new Reply(List.of(new Utterance("JOY", "우리 같이 한 걸음 시작해요.")),
+            return new Reply(List.of(new Utterance(characterKeys.getFirst(), "우리 같이 한 걸음 시작해요.")),
                     new Usage(100, 20, 30));
         }
 

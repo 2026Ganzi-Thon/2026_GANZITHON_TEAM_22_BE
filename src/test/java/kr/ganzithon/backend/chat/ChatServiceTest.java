@@ -74,6 +74,26 @@ class ChatServiceTest {
     }
 
     @Test
+    void routingFlagAndCandidateValidationProtectTheExistingResponseContract() {
+        stubOwner();
+        List<String> candidates = List.of("JOY", "SAD");
+        when(available.getIfAvailable()).thenReturn((content, priorUser, priorAssistant, keys) ->
+                new ChatProvider.Reply(List.of(new ChatProvider.Utterance("JOY", "같이 있을게."))));
+        var request = new ChatDto.Request(UUID.randomUUID(), "슬픔아, 잠깐 얘기할래?", null, null, candidates);
+
+        ChatService legacy = new ChatService(jdbc, Clock.systemUTC(), available, null, null, null, 30, false);
+        assertEquals("SUCCEEDED", legacy.create(userId, request).status());
+
+        ChatService routed = new ChatService(jdbc, Clock.systemUTC(), available, 30);
+        ChatDto.Exchange rejected = routed.create(userId, request);
+        assertEquals("FAILED", rejected.status());
+        assertTrue(rejected.utterances().isEmpty());
+
+        var ambiguous = new ChatDto.Request(UUID.randomUUID(), "오늘 하루가 좀 복잡했어.", null, null, candidates);
+        assertEquals("SUCCEEDED", routed.create(userId, ambiguous).status());
+    }
+
+    @Test
     void rateLimitCountsOnlyNewAdmissionsAndKeepsReplayAvailable() {
         stubOwner();
         AtomicInteger calls = new AtomicInteger();

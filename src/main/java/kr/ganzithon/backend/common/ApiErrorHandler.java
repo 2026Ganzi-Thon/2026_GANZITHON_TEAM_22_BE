@@ -21,7 +21,7 @@ import org.springframework.web.HttpMediaTypeNotSupportedException;
 public class ApiErrorHandler {
     @ExceptionHandler(ApiException.class)
     ResponseEntity<ApiError> api(ApiException ex, HttpServletRequest request) {
-        return error(ex.status(), ex.code(), ex.getMessage(), request);
+        return error(ex.status(), ex.code(), ex.getMessage(), request, ex.retryable());
     }
     @ExceptionHandler({HttpMessageNotReadableException.class, MethodArgumentNotValidException.class,
         ConstraintViolationException.class, MethodArgumentTypeMismatchException.class,
@@ -58,11 +58,14 @@ public class ApiErrorHandler {
         return error(500, "INTERNAL_ERROR", "처리 중 오류가 발생했습니다.", request);
     }
     private ResponseEntity<ApiError> error(int status, String code, String message, HttpServletRequest request) {
+        return error(status, code, message, request, status == 429 || status >= 500);
+    }
+    private ResponseEntity<ApiError> error(int status, String code, String message, HttpServletRequest request, boolean retryable) {
         var response = ResponseEntity.status(status);
         if ("CHAT_RATE_LIMITED".equals(code)) {
             response.header(HttpHeaders.RETRY_AFTER, "60");
         }
         return response.contentType(MediaType.APPLICATION_JSON).body(new ApiError(code, message,
-            String.valueOf(request.getAttribute("requestId")), status == 429 || status >= 500));
+            String.valueOf(request.getAttribute("requestId")), retryable));
     }
 }

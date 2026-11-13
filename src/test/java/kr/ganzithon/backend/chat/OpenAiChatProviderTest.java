@@ -27,6 +27,89 @@ class OpenAiChatProviderTest {
     private final List<String> keys = List.of("JOY", "ANGRY", "SAD");
 
     @Test
+    void focusedSolRequestUsesMediumThinkingAndQuotesThePayloadThatIsSent() throws Exception {
+        HttpServer server = server();
+        AtomicReference<byte[]> sent = new AtomicReference<>();
+        AtomicInteger calls = new AtomicInteger();
+        server.createContext("/v1/responses", exchange -> {
+            calls.incrementAndGet();
+            sent.set(exchange.getRequestBody().readAllBytes());
+            respond(exchange, 200, response("completed", """
+                {"utterances":[{"characterKey":"ANGRY","content":"그건 정말 속상했겠다."}]}
+                """));
+        });
+        server.start();
+        try {
+            OpenAiChatProvider provider = provider(server, 2, "gpt-6.1-sol", 2048);
+            ChatProvider.Turn turn = new ChatProvider.Turn("너무 억울해", null, null,
+                List.of("ANGRY"), "HOME", "어제 속상했던 일", true);
+            ChatProvider.CostQuote quote = provider.quote(turn);
+            ChatProvider.Reply reply = provider.generate(turn);
+            assertEquals(1, calls.get());
+            assertEquals("gpt-6.1-sol", quote.model());
+            assertEquals(sent.get().length + 4096L, quote.maxInputTokens());
+            assertEquals(2048, quote.maxOutputTokens());
+            assertEquals("ANGRY", reply.utterances().getFirst().characterKey());
+            JsonNode request = mapper.readTree(sent.get());
+            assertEquals("gpt-6.1-sol", request.path("model").asText());
+            assertEquals("standard", request.path("reasoning").path("mode").asText());
+            assertEquals("medium", request.path("reasoning").path("effort").asText());
+            assertEquals(2048, request.path("max_output_tokens").asInt());
+            String instructions = request.path("instructions").asText();
+            assertTrue(instructions.contains("화남이는 직설적"));
+            assertFalse(instructions.contains("기쁨이는 자신감"));
+            assertFalse(instructions.contains("슬픔이는 감수성"));
+            assertEquals("어제 속상했던 일", mapper.readTree(request.path("input").asText())
+                .path("memoryContext").asText());
+            assertEquals("ANGRY", request.path("text").path("format").path("schema")
+                .path("properties").path("utterances").path("items").path("properties")
+                .path("characterKey").path("enum").get(0).asText());
+        } finally { server.stop(0); }
+    }
+
+    @Test
+    void lunaAndTerraCanUseExplicitMediumThinking() throws Exception {
+        HttpServer server = server();
+        AtomicReference<byte[]> sent = new AtomicReference<>();
+        server.createContext("/v1/responses", exchange -> {
+            sent.set(exchange.getRequestBody().readAllBytes());
+            respond(exchange, 200, response("completed", """
+                {"utterances":[{"characterKey":"JOY","content":"함께 해보자."}]}
+                """));
+        });
+        server.start();
+        try {
+            for (String model : List.of("gpt-6-luna", "gpt-6.1-terra")) {
+                OpenAiChatProvider provider = provider(server, 2, model, 1024, "medium");
+                ChatProvider.Turn turn = new ChatProvider.Turn("공부 시작할래", null, null,
+                    List.of("JOY"), "HOME", null, true);
+                ChatProvider.CostQuote quote = provider.quote(turn);
+                provider.generate(turn);
+                JsonNode request = mapper.readTree(sent.get());
+                assertEquals(model, request.path("model").asText());
+                assertEquals("standard", request.path("reasoning").path("mode").asText());
+                assertEquals("medium", request.path("reasoning").path("effort").asText());
+                assertEquals(1024, request.path("max_output_tokens").asInt());
+                assertEquals(sent.get().length + 4096L, quote.maxInputTokens());
+            }
+        } finally { server.stop(0); }
+    }
+
+    @Test
+    void reasoningEffortMustBeSupportedByModel() throws Exception {
+        HttpServer server = server();
+        for (String model : List.of("gpt-6.1-sol", "gpt-6-luna", "gpt-6.1-terra")) {
+            assertEquals("CHAT_NOT_CONFIGURED", assertThrows(ApiException.class,
+                () -> provider(server, 2, model, 1024, "minimal").ensureConfigured()).code());
+        }
+        assertEquals("CHAT_NOT_CONFIGURED", assertThrows(ApiException.class,
+            () -> provider(server, 2, "gpt-6.1-sol", 1024, "none").ensureConfigured()).code());
+        for (String model : List.of("gpt-6.1-sol", "gpt-6-luna", "gpt-6.1-terra")) {
+            provider(server, 2, model, 1024, "xhigh").ensureConfigured();
+        }
+    }
+
+    @Test
     void quoteMatchesSentPayloadAndFourOrderedLinesIncludeUsage() throws Exception {
         HttpServer server = server();
         AtomicInteger calls = new AtomicInteger();
@@ -222,9 +305,21 @@ class OpenAiChatProviderTest {
     }
 
     private OpenAiChatProvider provider(HttpServer server, int timeoutSeconds) {
+        return provider(server, timeoutSeconds, "gpt-6-luna", 1024);
+    }
+
+    private OpenAiChatProvider provider(HttpServer server, int timeoutSeconds, String model, int maxOutputTokens) {
         URI uri = URI.create("http://127.0.0.1:" + server.getAddress().getPort() + "/v1/responses");
-        return new OpenAiChatProvider(mapper, "test-key", "gpt-6-luna", timeoutSeconds,
-            1024, uri, HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(1)).build());
+        return new OpenAiChatProvider(mapper, "test-key", model, timeoutSeconds,
+            maxOutputTokens, uri, HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(1)).build());
+    }
+
+    private OpenAiChatProvider provider(HttpServer server, int timeoutSeconds, String model,
+                                        int maxOutputTokens, String reasoningEffort) {
+        URI uri = URI.create("http://127.0.0.1:" + server.getAddress().getPort() + "/v1/responses");
+        return new OpenAiChatProvider(mapper, "test-key", model, timeoutSeconds,
+            maxOutputTokens, reasoningEffort, uri,
+            HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(1)).build());
     }
 
     private void respond(HttpExchange exchange, int status, String body) throws java.io.IOException {

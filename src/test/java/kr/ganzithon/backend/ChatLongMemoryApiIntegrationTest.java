@@ -51,6 +51,7 @@ class ChatLongMemoryApiIntegrationTest {
     @Autowired ChatMemoryService memory;
     @Autowired IdentityService identities;
     @Autowired ChatBudgetService budget;
+    @Autowired ChatService chat;
     @Autowired ObjectProvider<ChatProvider> providers;
     @Autowired Clock clock;
     @Autowired TransactionTemplate transactions;
@@ -110,6 +111,14 @@ class ChatLongMemoryApiIntegrationTest {
         JsonNode healthyPage = getHistory(owner, null, 200);
         assertEquals(0, healthyPage.path("items").size());
         assertFalse(healthyPage.toString().contains("tampered"));
+        // Simulate a cold result cache so the API reads the damaged durable copy.
+        chat.forgetUser(owner.id());
+        JsonNode corruptResult = mapper.readTree(mvc.perform(get("/api/v1/chat/exchanges")
+                .header("Authorization", "Bearer " + owner.token())
+                .param("clientRequestId", first.path("clientRequestId").asText()))
+            .andExpect(status().isServiceUnavailable()).andReturn().getResponse().getContentAsString());
+        assertEquals("CHAT_HISTORY_UNAVAILABLE", corruptResult.path("code").asText());
+        assertFalse(corruptResult.path("retryable").asBoolean());
         ChatService restarted = new ChatService(jdbc, clock, providers, budget, memory, transactions, 30);
         var error = assertThrows(kr.ganzithon.backend.common.ApiException.class,
             () -> restarted.recover(owner.id(), UUID.fromString(first.path("clientRequestId").asText())));

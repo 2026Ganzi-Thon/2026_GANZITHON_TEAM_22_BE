@@ -28,6 +28,7 @@ ganzi:
     days: 30
   chat:
     enabled: ${GANZI_CHAT_ENABLED:false}
+    intent-routing-enabled: ${GANZI_CHAT_INTENT_ROUTING_ENABLED:true}
     provider: openai
     memory:
       archive-enabled: ${GANZI_CHAT_ARCHIVE_ENABLED:true}
@@ -42,9 +43,10 @@ ganzi:
     response-deadline-seconds: ${GANZI_CHAT_RESPONSE_DEADLINE_SECONDS:30}
   openai:
     api-key: ${OPENAI_API_KEY:}
-    model: ${GANZI_OPENAI_MODEL:gpt-6-luna}
+    model: ${GANZI_OPENAI_MODEL:gpt-6.1-sol}
+    reasoning-effort: ${GANZI_OPENAI_REASONING_EFFORT:}
     timeout-seconds: ${GANZI_OPENAI_TIMEOUT_SECONDS:20}
-    max-output-tokens: ${GANZI_OPENAI_MAX_OUTPUT_TOKENS:1024}
+    max-output-tokens: ${GANZI_OPENAI_MAX_OUTPUT_TOKENS:2048}
   rate-limit:
     enabled: ${GANZI_RATE_LIMIT_ENABLED:true}
     global-per-minute: ${GANZI_RATE_LIMIT_GLOBAL_PER_MINUTE:120}
