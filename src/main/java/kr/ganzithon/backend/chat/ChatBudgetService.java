@@ -82,9 +82,15 @@ public class ChatBudgetService {
         long inputRate = switch (quote.model()) {
             case "gpt-6-luna" -> 250; // Standard input, including a conservative 2.5x cache-write allowance.
             case "gpt-6.1-terra" -> 2500;
+            case "gpt-6.1-sol" -> 5000;
             default -> throw failure("AI_MODEL_PRICE_NOT_CONFIGURED");
         };
-        long outputRate = quote.model().equals("gpt-6-luna") ? 500 : 5000;
+        long outputRate = switch (quote.model()) {
+            case "gpt-6-luna" -> 500;
+            case "gpt-6.1-terra" -> 5000;
+            case "gpt-6.1-sol" -> 10000;
+            default -> throw failure("AI_MODEL_PRICE_NOT_CONFIGURED");
+        };
         if (quote.maxInputTokens() < 1 || quote.maxInputTokens() > 200000
                 || quote.maxOutputTokens() < 1 || quote.maxOutputTokens() > 4096) {
             throw failure("AI_REQUEST_TOO_LARGE");

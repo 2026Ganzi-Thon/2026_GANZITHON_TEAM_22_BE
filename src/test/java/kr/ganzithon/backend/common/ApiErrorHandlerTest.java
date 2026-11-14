@@ -74,6 +74,20 @@ class ApiErrorHandlerTest {
             .andExpect(content().string(not(containsString("private-internal-detail"))));
     }
 
+    @Test void definitiveCorruptionIsNotMarkedRetryableEvenThoughTheStatusIs503() throws Exception {
+        mvc.perform(get("/corrupt").requestAttr("requestId", REQUEST_ID))
+            .andExpect(status().isServiceUnavailable())
+            .andExpect(jsonPath("$.code").value("CHAT_HISTORY_UNAVAILABLE"))
+            .andExpect(jsonPath("$.retryable").value(false));
+    }
+
+    @Test void temporaryHistoryFailureRemainsRetryable() throws Exception {
+        mvc.perform(get("/temporary").requestAttr("requestId", REQUEST_ID))
+            .andExpect(status().isServiceUnavailable())
+            .andExpect(jsonPath("$.code").value("CHAT_HISTORY_UNAVAILABLE"))
+            .andExpect(jsonPath("$.retryable").value(true));
+    }
+
     @RestController
     static class InputController {
         @PostMapping(value = "/input", produces = MediaType.APPLICATION_JSON_VALUE)
@@ -81,5 +95,11 @@ class ApiErrorHandlerTest {
 
         @GetMapping("/failure")
         Map<String, String> fail() { throw new IllegalStateException("private-internal-detail"); }
+
+        @GetMapping("/corrupt")
+        Map<String, String> corrupt() { throw new ApiException(503, "CHAT_HISTORY_UNAVAILABLE", "Saved conversation could not be read safely", false); }
+
+        @GetMapping("/temporary")
+        Map<String, String> temporary() { throw new ApiException(503, "CHAT_HISTORY_UNAVAILABLE", "Conversation history is temporarily unavailable"); }
     }
 }

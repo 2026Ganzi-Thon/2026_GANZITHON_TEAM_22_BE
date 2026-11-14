@@ -35,5 +35,8 @@ Windows에서 Node.js와 MySQL 8을 설치한 뒤 `node scripts/verify-local.mjs
 | `GANZI_DB_USERNAME`, `GANZI_DB_PASSWORD` | 애플리케이션 전용 DB 계정 |
 | `GANZI_ALLOWED_ORIGINS` | 웹 프론트 Origin을 쉼표로 구분한 목록. 예시 `http://localhost:5173` |
 | `GANZI_CHAT_ENABLED`, `GANZI_PUSH_ENABLED` | 초기 배포에서는 `false`. 각 제공자 설정을 검증한 뒤 활성화 |
+| `GANZI_OPENAI_MODEL`, `GANZI_OPENAI_MAX_OUTPUT_TOKENS` | 기본 `gpt-6.1-sol`(Thinking `medium`), 출력 상한 `2048` 토큰 |
+| `GANZI_OPENAI_REASONING_EFFORT` | 미지정 시 Sol은 `medium`, Luna·Terra는 `none`. 동일한 추론 조건으로 비교할 때는 `medium`을 명시 |
+| `GANZI_CHAT_INTENT_ROUTING_ENABLED` | 기본 `true`. `false`로 설정하면 그룹 프롬프트로 대화한다. [캐릭터 대화 연동 가이드](docs/chat-intent-routing.md) |
 
 DB 비밀번호와 외부 API 키는 AWS의 비밀값 관리 기능을 통해 실행 환경에 주입합니다. AWS 배포 후에는 `/health`와 Flyway 적용을 확인하고 프론트의 API 기본 주소를 새 HTTPS 주소로 연결합니다. AWS 실행 환경의 검증은 실제 배포 시 진행합니다.

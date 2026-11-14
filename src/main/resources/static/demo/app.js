@@ -2,6 +2,7 @@
 (() => {
   "use strict";
   const API = "/api/v1";
+  const CHAT_REQUEST_TIMEOUT_MS = 35_000;
   const TOKEN_KEY = "ganzi-demo-access-token";
   const state = {
     token: sessionStorage.getItem(TOKEN_KEY) || "",
@@ -9,7 +10,7 @@
     detail: null, selectedTaskId: null, page: "home", sheet: "",
     accountTab: "register", busy: false, loaded: false, cameraStream: null, log: [],
     reminder: null, lastEndedSessionId: null, usage: null,
-    chat: {}, chatScope: "home", chatCharacters: ["JOY"], chatPending: null, chatNotice: ""
+    chat: {}, chatScope: "home", chatCharacters: ["JOY", "ANGRY", "SAD"], chatPending: null, chatNotice: ""
   };
   const screen = document.getElementById("screen");
   const sheetRoot = document.getElementById("sheet-root");
@@ -112,7 +113,7 @@
       add(li, details); add(logRoot, li);
     }
   }
-  async function request(method, path, body, useToken = true) {
+  async function request(method, path, body, useToken = true, timeoutMs = 0) {
     const headers = {Accept: "application/json"};
     if (body !== undefined) headers["Content-Type"] = "application/json";
     if (useToken && state.token) headers.Authorization = "Bearer " + state.token;
@@ -120,6 +121,7 @@
     try {
       response = await fetch(API + path, {
         method, headers, cache: "no-store",
+        signal: timeoutMs ? AbortSignal.timeout(timeoutMs) : undefined,
         body: body === undefined ? undefined : JSON.stringify(body)
       });
       const raw = await response.text();
@@ -140,6 +142,7 @@
         const error = new Error(message);
         error.status = response.status;
         error.code = payload && payload.code;
+        error.retryable = payload?.retryable;
         throw error;
       }
       connection.textContent = "API 연결됨";
@@ -231,6 +234,7 @@
     AI_BUDGET_EXCEEDED:"이번 기간의 대화 예산에 도달했어요.",
     AI_DAILY_USAGE_EXCEEDED:"오늘의 대화 한도에 도달했어요.",
     CHAT_DEADLINE_EXCEEDED:"답변 시간이 지나 대화를 마치지 못했어요.",
+    CHAT_HISTORY_UNAVAILABLE:"이 대화 결과를 불러올 수 없어요.",
     STUDY_SESSION_ENDED:"공부가 끝나 답변을 표시하지 못했어요."
   };
   function chatScope() { return state.page==="room" && state.current ? "room:" + state.current.id : "home"; }
@@ -238,7 +242,7 @@
   function latestChatId(scope) {
     const items = chatItems(scope);
     const last=[...items].reverse().find(item=>item.exchange);
-    return last?.exchange.status === "SUCCEEDED" ? last.body.clientRequestId : null;
+    return last?.exchange.status === "SUCCEEDED" && !last.invalidAnchor ? last.body.clientRequestId : null;
   }
   function reminderTime(value) {
     return new Intl.DateTimeFormat("ko-KR", {dateStyle:"medium", timeStyle:"short"}).format(new Date(value));
@@ -553,7 +557,7 @@
       add(panel,choices);
       const history=el("div","chat-history");
       const items=chatItems(state.chatScope);
-      if (!items.length) add(history,notice("아직 대화가 없어요. 이야기하면 선택한 친구가 답해 줍니다.","blue"));
+      if (!items.length) add(history,notice("선택된 친구들 중에서 이야기에 맞는 친구가 답해요.","blue"));
       for (const item of items) {
         add(history,el("div","chat-bubble mine",item.body.content));
         if (item.exchange?.status==="SUCCEEDED") for (const line of item.exchange.utterances||[]) {
@@ -685,20 +689,28 @@
   async function sendChat(pending) {
     pending.uncertain=false;state.chatPending=pending;state.chatNotice="";render();
     try {
-      const result=await request("POST","/chat/exchanges",pending.body);
+      const result=await request("POST","/chat/exchanges",pending.body,true,CHAT_REQUEST_TIMEOUT_MS);
       const item=chatItems(pending.scope).find(x=>x.body.clientRequestId===pending.body.clientRequestId);
       if(item) item.exchange=result;
       state.chatPending=null;
       if (result.status==="FAILED") state.chatNotice=failureNames[result.failureCode]||"답변이 실패했어요. ("+(result.failureCode||"원인 미확인")+")";
     } catch(error) {
-      if(error.code==="REQUEST_IN_PROGRESS" || error.status>=500) {
+      if(error.code==="REQUEST_IN_PROGRESS" || (error.status>=500 && error.retryable!==false)) {
         pending.uncertain=true;
         state.chatNotice="전송 결과가 아직 확실하지 않아요. 먼저 결과를 확인해 주세요.";
       } else if(error.status) {
-        chatItems(pending.scope).splice(chatItems(pending.scope).findIndex(x=>x.body.clientRequestId===pending.body.clientRequestId),1);
+        const items=chatItems(pending.scope);
+        const index=items.findIndex(x=>x.body.clientRequestId===pending.body.clientRequestId);
+        if(index>=0) items.splice(index,1);
+        if(error.code==="INVALID_PREVIOUS_EXCHANGE") {
+          const previous=items.find(x=>x.body.clientRequestId===pending.body.previousRequestId);
+          if(previous) previous.invalidAnchor=true;
+        }
         state.chatDraft=pending.body.content;
         state.chatPending=null;
-        state.chatNotice=chatError(error);
+        state.chatNotice=error.code==="INVALID_PREVIOUS_EXCHANGE"
+          ?"직전 대화와 연결할 수 없어요. 다시 보내면 새 대화로 이어져요."
+          :chatError(error);
       } else {
         pending.uncertain=true;
         state.chatNotice="연결이 끊겨 전송 결과를 확인하지 못했어요. 먼저 결과를 확인해 주세요.";
@@ -709,14 +721,22 @@
     const pending=state.chatPending;
     if(!pending) return;
     try {
-      const result=await request("GET","/chat/exchanges?clientRequestId="+encodeURIComponent(pending.body.clientRequestId));
+      const result=await request("GET","/chat/exchanges?clientRequestId="+encodeURIComponent(pending.body.clientRequestId),
+        undefined,true,CHAT_REQUEST_TIMEOUT_MS);
       const exchange=result?.items?.[0];
       if(exchange && exchange.status!=="PROCESSING") {
         const item=chatItems(pending.scope).find(x=>x.body.clientRequestId===pending.body.clientRequestId);
         if(item) item.exchange=exchange;
         state.chatPending=null;state.chatNotice=exchange.status==="FAILED"?(failureNames[exchange.failureCode]||"답변을 받지 못했어요."):"전송 결과를 확인했어요.";
       } else state.chatNotice=exchange?"친구가 아직 답을 생각하고 있어요. 잠시 뒤 다시 확인해 주세요.":"아직 확인된 결과가 없어요. 같은 메시지를 다시 전송할 수 있어요.";
-    } catch(error) {state.chatNotice=chatError(error);}
+    } catch(error) {
+      if(error.code==="CHAT_HISTORY_UNAVAILABLE" && error.retryable===false) {
+        const item=chatItems(pending.scope).find(x=>x.body.clientRequestId===pending.body.clientRequestId);
+        if(item) item.exchange={status:"FAILED",failureCode:error.code};
+        state.chatPending=null;
+      }
+      state.chatNotice=chatError(error);
+    }
     render();
   }
   async function saveReminder(date) {

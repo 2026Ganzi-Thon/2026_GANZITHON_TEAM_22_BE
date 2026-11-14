@@ -22,6 +22,7 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
+import java.util.function.Supplier;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 import java.util.zip.GZIPInputStream;
@@ -30,6 +31,9 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import kr.ganzithon.backend.common.ApiException;
 import kr.ganzithon.backend.common.PortableJdbc;
+import org.springframework.dao.DataAccessResourceFailureException;
+import org.springframework.dao.RecoverableDataAccessException;
+import org.springframework.dao.TransientDataAccessException;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
@@ -56,7 +60,7 @@ public class ChatMemoryService {
     /** Only a persisted payload that fails integrity or shape checks is quarantinable. */
     private static final class CorruptPayloadException extends ApiException {
         private CorruptPayloadException() {
-            super(503, "CHAT_HISTORY_UNAVAILABLE", "Saved conversation could not be read safely");
+            super(503, "CHAT_HISTORY_UNAVAILABLE", "Saved conversation could not be read safely", false);
         }
     }
 
@@ -109,16 +113,16 @@ public class ChatMemoryService {
 
     public Optional<Saved> find(UUID userId, UUID clientRequestId) {
         if (userId == null || clientRequestId == null) return Optional.empty();
-        List<Row> rows = jdbc.query("SELECT " + COLUMNS + " FROM chat_memory WHERE user_id=? AND client_request_id=?", this::row, userId, clientRequestId);
+        List<Row> rows = read(() -> jdbc.query("SELECT " + COLUMNS + " FROM chat_memory WHERE user_id=? AND client_request_id=?", this::row, userId, clientRequestId));
         return rows.isEmpty() ? Optional.empty() : Optional.of(saved(rows.get(0)));
     }
 
     /** Most recently finalized exchange in this room; a failed turn still blocks stale previousRequestId. */
     public Optional<Saved> latest(UUID userId, UUID studySessionId) {
         if (userId == null) return Optional.empty();
-        List<Row> rows = studySessionId == null
+        List<Row> rows = read(() -> studySessionId == null
                 ? jdbc.query("SELECT " + COLUMNS + " FROM chat_memory WHERE user_id=? AND study_session_id IS NULL ORDER BY finished_at DESC,sequence_id DESC LIMIT 1", this::row, userId)
-                : jdbc.query("SELECT " + COLUMNS + " FROM chat_memory WHERE user_id=? AND study_session_id=? ORDER BY finished_at DESC,sequence_id DESC LIMIT 1", this::row, userId, studySessionId);
+                : jdbc.query("SELECT " + COLUMNS + " FROM chat_memory WHERE user_id=? AND study_session_id=? ORDER BY finished_at DESC,sequence_id DESC LIMIT 1", this::row, userId, studySessionId));
         if (rows.isEmpty()) return Optional.empty();
         try {
             return Optional.of(saved(rows.getFirst()));
@@ -137,10 +141,11 @@ public class ChatMemoryService {
         List<Row> healthyRows = new ArrayList<>();
         List<Saved> healthy = new ArrayList<>();
         while (healthy.size() <= limit) {
-            List<Row> rows = after == null
+            Cursor pageStart = after;
+            List<Row> rows = read(() -> pageStart == null
                     ? jdbc.query("SELECT " + COLUMNS + " FROM chat_memory WHERE user_id=? AND NOT EXISTS (SELECT 1 FROM chat_memory_quarantine q WHERE q.memory_id=chat_memory.id) ORDER BY finished_at DESC,sequence_id DESC LIMIT ?", this::row, userId, limit + 1)
                     : jdbc.query("SELECT " + COLUMNS + " FROM chat_memory WHERE user_id=? AND NOT EXISTS (SELECT 1 FROM chat_memory_quarantine q WHERE q.memory_id=chat_memory.id) AND (finished_at<? OR (finished_at=? AND sequence_id<?)) ORDER BY finished_at DESC,sequence_id DESC LIMIT ?", this::row,
-                            userId, after.finishedAt(), after.finishedAt(), after.sequenceId(), limit + 1);
+                            userId, pageStart.finishedAt(), pageStart.finishedAt(), pageStart.sequenceId(), limit + 1));
             if (rows.isEmpty()) break;
             for (Row row : rows) {
                 after = new Cursor(row.finishedAt(), row.sequenceId());
@@ -162,11 +167,11 @@ public class ChatMemoryService {
     /** A bounded prompt excerpt: recent turns plus up to two older lexical matches. */
     public String context(UUID userId, String currentInput, UUID excludedRequestId) {
         if (userId == null) return contextJson(clock.instant(), List.of());
-        List<Row> recent = excludedRequestId == null
+        List<Row> recent = read(() -> excludedRequestId == null
                 ? jdbc.query("SELECT " + COLUMNS + " FROM chat_memory WHERE user_id=? AND status='SUCCEEDED' AND NOT EXISTS (SELECT 1 FROM chat_memory_quarantine q WHERE q.memory_id=chat_memory.id) ORDER BY finished_at DESC,sequence_id DESC LIMIT 8",
                         this::row, userId)
                 : jdbc.query("SELECT " + COLUMNS + " FROM chat_memory WHERE user_id=? AND status='SUCCEEDED' AND NOT EXISTS (SELECT 1 FROM chat_memory_quarantine q WHERE q.memory_id=chat_memory.id) AND client_request_id<>? ORDER BY finished_at DESC,sequence_id DESC LIMIT 8",
-                        this::row, userId, excludedRequestId);
+                        this::row, userId, excludedRequestId));
         LinkedHashMap<UUID, Row> selected = new LinkedHashMap<>();
         for (Row row : recent) {
             selected.put(row.id(), row);
@@ -178,14 +183,14 @@ public class ChatMemoryService {
             args.add(userId);
             for (String term : clues) args.add(sha(term.getBytes(StandardCharsets.UTF_8)));
             args.add(12);
-            List<UUID> matches = jdbc.query("SELECT t.memory_id FROM chat_memory_terms t JOIN chat_memory m ON m.user_id=t.user_id AND m.id=t.memory_id WHERE t.user_id=? AND m.status='SUCCEEDED' AND NOT EXISTS (SELECT 1 FROM chat_memory_quarantine q WHERE q.memory_id=m.id) AND t.term_hash IN (" + placeholders + ") GROUP BY t.memory_id ORDER BY COUNT(*) DESC,MAX(m.finished_at) DESC,MAX(m.sequence_id) DESC LIMIT ?",
-                    (rs, index) -> PortableJdbc.uuid(rs, 1), args.toArray());
+            List<UUID> matches = read(() -> jdbc.query("SELECT t.memory_id FROM chat_memory_terms t JOIN chat_memory m ON m.user_id=t.user_id AND m.id=t.memory_id WHERE t.user_id=? AND m.status='SUCCEEDED' AND NOT EXISTS (SELECT 1 FROM chat_memory_quarantine q WHERE q.memory_id=m.id) AND t.term_hash IN (" + placeholders + ") GROUP BY t.memory_id ORDER BY COUNT(*) DESC,MAX(m.finished_at) DESC,MAX(m.sequence_id) DESC LIMIT ?",
+                    (rs, index) -> PortableJdbc.uuid(rs, 1), args.toArray()));
             if (!matches.isEmpty()) {
                 String ids = String.join(",", java.util.Collections.nCopies(matches.size(), "?"));
                 List<Object> lookup = new ArrayList<>();
                 lookup.add(userId);
                 lookup.addAll(matches);
-                List<Row> older = jdbc.query("SELECT " + COLUMNS + " FROM chat_memory WHERE user_id=? AND id IN (" + ids + ") AND status='SUCCEEDED' AND NOT EXISTS (SELECT 1 FROM chat_memory_quarantine q WHERE q.memory_id=chat_memory.id)", this::row, lookup.toArray());
+                List<Row> older = read(() -> jdbc.query("SELECT " + COLUMNS + " FROM chat_memory WHERE user_id=? AND id IN (" + ids + ") AND status='SUCCEEDED' AND NOT EXISTS (SELECT 1 FROM chat_memory_quarantine q WHERE q.memory_id=chat_memory.id)", this::row, lookup.toArray()));
                 Map<UUID, Row> byId = new LinkedHashMap<>();
                 for (Row row : older) byId.put(row.id(), row);
                 int added = 0;
@@ -367,6 +372,14 @@ public class ChatMemoryService {
     }
 
     private static ApiException unavailable() {
-        return new ApiException(503, "CHAT_HISTORY_UNAVAILABLE", "Saved conversation could not be read safely");
+        return new ApiException(503, "CHAT_HISTORY_UNAVAILABLE", "Conversation history is temporarily unavailable");
+    }
+
+    private static <T> T read(Supplier<T> query) {
+        try {
+            return query.get();
+        } catch (DataAccessResourceFailureException | RecoverableDataAccessException | TransientDataAccessException exception) {
+            throw unavailable();
+        }
     }
 }
