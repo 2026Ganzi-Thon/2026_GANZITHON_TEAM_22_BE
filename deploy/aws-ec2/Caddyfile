@@ -1,0 +1,12 @@
+{$HAEBOYANG_API_HOSTNAME} {
+	request_body {
+		max_size 64KiB
+	}
+
+	handle /api/v1/* {
+		reverse_proxy api:8080
+	}
+	handle {
+		respond 404
+	}
+}

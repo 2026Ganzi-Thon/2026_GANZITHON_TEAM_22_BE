@@ -1,0 +1,14 @@
+{$HAEBOYANG_API_HOSTNAME} {
+	request_body {
+		max_size 64KiB
+	}
+
+	@enrollment path /api/v1/auth/register* /api/v1/guest-sessions*
+	@api path_regexp ^/api/v1/[a-zA-Z0-9_-]+(/[a-zA-Z0-9_-]+)*$
+
+	route {
+		respond @enrollment 404
+		reverse_proxy @api api:8080
+		respond 404
+	}
+}
