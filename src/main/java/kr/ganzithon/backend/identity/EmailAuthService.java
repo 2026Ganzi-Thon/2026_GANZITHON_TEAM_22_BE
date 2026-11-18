@@ -8,7 +8,7 @@ import java.util.Objects;
 import java.util.UUID;
 import kr.ganzithon.backend.common.ApiException;
 import kr.ganzithon.backend.common.PortableJdbc;
-import org.springframework.dao.DataIntegrityViolationException;
+import org.springframework.dao.DuplicateKeyException;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.support.TransactionTemplate;
@@ -32,8 +32,7 @@ public class EmailAuthService {
         String email=normalizeEmail(rawEmail);
         requireNewPassword(password);
         String encoded=passwords.hash(password); // The expensive work happens before acquiring a DB lock.
-        try {
-            return Objects.requireNonNull(transactions.execute(status -> {
+        return Objects.requireNonNull(transactions.execute(status -> {
                 UUID userId=guestId;
                 Instant now=clock.instant();
                 if (userId == null) {
@@ -47,14 +46,15 @@ public class EmailAuthService {
                         throw new ApiException(409,"ACCOUNT_ALREADY_REGISTERED","이미 이메일 계정이 연결돼 있습니다.");
                     }
                 }
-                jdbc.update("INSERT INTO email_accounts(user_id,normalized_email,password_hash,email_verified,created_at,updated_at) "
-                        + "VALUES(?,?,?,FALSE,?,?)",userId,email,encoded,Timestamp.from(now),Timestamp.from(now));
+                try {
+                    jdbc.update("INSERT INTO email_accounts(user_id,normalized_email,password_hash,email_verified,created_at,updated_at) "
+                            + "VALUES(?,?,?,FALSE,?,?)",userId,email,encoded,Timestamp.from(now),Timestamp.from(now));
+                } catch (DuplicateKeyException ex) {
+                    throw new ApiException(409,"EMAIL_ALREADY_REGISTERED","이미 등록된 이메일입니다.");
+                }
                 jdbc.update("DELETE FROM auth_sessions WHERE user_id=?",userId);
                 return identity.issueSession(userId,email,false);
             }));
-        } catch (DataIntegrityViolationException ex) {
-            throw new ApiException(409,"EMAIL_ALREADY_REGISTERED","이미 등록된 이메일입니다.");
-        }
     }
 
     public IdentityService.AuthSessionDTO login(String rawEmail, String password) {

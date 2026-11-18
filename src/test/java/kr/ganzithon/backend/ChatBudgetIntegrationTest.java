@@ -4,7 +4,6 @@ import java.math.BigDecimal;
 import java.sql.Timestamp;
 import java.time.Clock;
 import java.time.Instant;
-import java.time.temporal.ChronoUnit;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.UUID;
@@ -14,30 +13,39 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.BooleanSupplier;
 import kr.ganzithon.backend.chat.ChatBudgetService;
 import kr.ganzithon.backend.chat.ChatDto;
 import kr.ganzithon.backend.chat.ChatMemoryService;
 import kr.ganzithon.backend.chat.ChatProvider;
+import kr.ganzithon.backend.chat.ChatProviderException;
 import kr.ganzithon.backend.chat.ChatService;
 import kr.ganzithon.backend.common.ApiException;
 import kr.ganzithon.backend.identity.IdentityService;
+import kr.ganzithon.backend.study.StudyService;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.boot.test.context.SpringBootTest;
+import org.springframework.dao.DataAccessResourceFailureException;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.test.context.ActiveProfiles;
 import org.springframework.test.context.ContextConfiguration;
 import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
 import org.springframework.transaction.PlatformTransactionManager;
+import org.springframework.transaction.support.TransactionCallback;
+import org.springframework.transaction.support.TransactionSynchronizationManager;
 import org.springframework.transaction.support.TransactionTemplate;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.mockito.AdditionalAnswers.delegatesTo;
 import static org.mockito.ArgumentMatchers.*;
 import static org.mockito.Mockito.*;
 
@@ -47,6 +55,8 @@ import static org.mockito.Mockito.*;
 class ChatBudgetIntegrationTest {
     private static final String CONFIG_SCOPE = scopeName();
     private static final ChatProvider.CostQuote QUOTE = new ChatProvider.CostQuote("gpt-6-luna", 100, 10);
+    private static final ChatProvider.CostQuote SOL_62_QUOTE = new ChatProvider.CostQuote("gpt-6.2-sol", 100, 10);
+    private static final ChatProvider.Usage SOL_62_USAGE = new ChatProvider.Usage(100, 30, 3, 30);
 
     @DynamicPropertySource
     static void budgetProperties(DynamicPropertyRegistry properties) {
@@ -59,6 +69,7 @@ class ChatBudgetIntegrationTest {
     @Autowired ChatBudgetService configuredBudget;
     @Autowired ChatMemoryService memory;
     @Autowired IdentityService identities;
+    @Autowired StudyService studies;
     private final List<String> scopes = new ArrayList<>();
     private final List<UUID> users = new ArrayList<>();
 
@@ -69,7 +80,10 @@ class ChatBudgetIntegrationTest {
             jdbc.update("DELETE FROM chat_spend_periods WHERE scope=?", scope);
             jdbc.update("DELETE FROM chat_billing_state WHERE scope=?", scope);
         }
-        for (UUID user : users) jdbc.update("DELETE FROM users WHERE id=?", user.toString());
+        for (UUID user : users) {
+            jdbc.update("DELETE FROM study_sessions WHERE user_id=?", user.toString());
+            jdbc.update("DELETE FROM users WHERE id=?", user.toString());
+        }
     }
 
     @Test
@@ -166,39 +180,277 @@ class ChatBudgetIntegrationTest {
     }
 
     @Test
-    void interruptedCompletionDoesNotCommitTheResultOrFreeTheReservation() {
+    void admissionFaultDoesNotReleaseAnotherInstancesReservation() {
         scopes.add(CONFIG_SCOPE);
         UUID user = user();
         var request = request();
         var calls = new AtomicInteger();
         ChatProvider provider = provider(calls::incrementAndGet);
-        ChatBudgetService failingBudget = mock(ChatBudgetService.class);
-        when(failingBudget.reserve(eq(user), eq(request.clientRequestId()), anyString(), any()))
-                .thenAnswer(call -> configuredBudget.reserve(call.getArgument(0), call.getArgument(1),
-                        call.getArgument(2), call.getArgument(3)));
+        ChatBudgetService failingBudget = mock(ChatBudgetService.class, delegatesTo(configuredBudget));
         doAnswer(call -> {
-            configuredBudget.settle(call.getArgument(0), call.getArgument(1), call.getArgument(2), call.getArgument(3));
-            throw new IllegalStateException("simulated commit failure");
-        }).when(failingBudget).settle(any(), any(), anyBoolean(), isNull());
+            configuredBudget.reserve(call.getArgument(0), call.getArgument(1), call.getArgument(2), call.getArgument(3));
+            throw new DataAccessResourceFailureException("this attempt did not reach storage");
+        }).when(failingBudget).reserve(eq(user), eq(request.clientRequestId()), anyString(), any(), any());
 
-        assertEquals("AI_USAGE_RECORD_FAILED", chat(provider, failingBudget).create(user, request).failureCode());
-        assertTrue(memory.find(user, request.clientRequestId()).isEmpty());
-        assertEquals(new BigDecimal("0.000030000"), configuredBudget.usage(user).daily().reservedUsd());
+        assertEquals("CHAT_ADMISSION_UNAVAILABLE", assertThrows(ApiException.class,
+                () -> chat(provider, failingBudget).create(user, request)).code());
         assertEquals("REQUEST_IN_PROGRESS", assertThrows(ApiException.class,
                 () -> chat(provider, configuredBudget).create(user, request)).code());
+        assertEquals(new BigDecimal("0.000030000"), configuredBudget.usage(user).daily().reservedUsd());
+        assertTrue(memory.find(user, request.clientRequestId()).isEmpty());
+        assertEquals(0, calls.get());
+    }
 
-        jdbc.update("UPDATE chat_usage_events SET created_at=? WHERE scope=? AND client_request_id=?",
-                Timestamp.from(clock.instant().minus(6, ChronoUnit.MINUTES)), CONFIG_SCOPE,
-                request.clientRequestId().toString());
-        configuredBudget.settleAbandonedReservations();
-        configuredBudget.settleAbandonedReservations();
-        assertEquals("UNKNOWN", jdbc.queryForObject("SELECT status FROM chat_usage_events "
+    @ParameterizedTest
+    @ValueSource(booleans = {true, false})
+    void admissionFailureReturnsRetryable503WithoutStartingProvider(boolean committed) {
+        scopes.add(CONFIG_SCOPE);
+        UUID user = user();
+        var request = request();
+        var calls = new AtomicInteger();
+        ChatProvider provider = provider(calls::incrementAndGet, SOL_62_QUOTE, SOL_62_USAGE);
+        ChatBudgetService failingBudget = mock(ChatBudgetService.class, delegatesTo(configuredBudget));
+        doAnswer(call -> {
+            UUID reservationId = call.getArgument(4);
+            if (committed) {
+                configuredBudget.reserve(call.getArgument(0), call.getArgument(1), call.getArgument(2),
+                        call.getArgument(3), reservationId);
+            } else {
+                tx(() -> {
+                    configuredBudget.reserve(call.getArgument(0), call.getArgument(1), call.getArgument(2),
+                            call.getArgument(3), reservationId);
+                    throw new DataAccessResourceFailureException("admission transaction rolled back");
+                });
+            }
+            throw new DataAccessResourceFailureException("admission acknowledgement unavailable");
+        }).when(failingBudget).reserve(eq(user), eq(request.clientRequestId()), anyString(), any(), any());
+
+        ChatService service = chat(provider, failingBudget);
+        ApiException error = assertThrows(ApiException.class, () -> service.create(user, request));
+        assertEquals(503, error.status());
+        assertEquals("CHAT_ADMISSION_UNAVAILABLE", error.code());
+        assertTrue(error.retryable());
+        assertTrue(service.recover(user, request.clientRequestId()).items().isEmpty());
+        assertEquals(0, calls.get());
+        assertEquals(new BigDecimal("0.000000000"), configuredBudget.usage(user).daily().reservedUsd());
+        assertEquals(new BigDecimal("0.000000000"), configuredBudget.usage(user).daily().estimatedUsd());
+        assertEquals(committed ? 1 : 0, configuredBudget.usage(user).daily().requests());
+
+        ChatService anotherInstance = chat(provider, configuredBudget);
+        if (committed) {
+            assertEquals("REJECTED", jdbc.queryForObject("SELECT status FROM chat_usage_events "
+                    + "WHERE scope=? AND client_request_id=?", String.class, CONFIG_SCOPE, request.clientRequestId().toString()));
+            assertEquals("CHAT_RESULT_UNAVAILABLE", anotherInstance.create(user, request).failureCode());
+            assertEquals(0, calls.get());
+        } else {
+            assertEquals("SUCCEEDED", anotherInstance.create(user, request).status());
+            assertEquals(1, calls.get());
+        }
+    }
+
+    @Test
+    void transientSettlementFailureRollsBackAndReplaysTheSameExchangeWithOneCharge() {
+        scopes.add(CONFIG_SCOPE);
+        UUID user = user();
+        var request = request();
+        var calls = new AtomicInteger();
+        var completionAttempts = new AtomicInteger();
+        ChatProvider provider = provider(calls::incrementAndGet, SOL_62_QUOTE, SOL_62_USAGE);
+        ChatBudgetService failingBudget = failCompletionSettlement(() -> completionAttempts.getAndIncrement() == 0);
+
+        ChatDto.Exchange result = chat(provider, failingBudget).create(user, request);
+        assertEquals("SUCCEEDED", result.status());
+        assertEquals(result, chat(provider, configuredBudget).create(user, request));
+        assertEquals(2, completionAttempts.get());
+        assertEquals(1, calls.get());
+        assertSol62Charge(user, request.clientRequestId());
+    }
+
+    @Test
+    void roomEndingAfterRolledBackCompletionDiscardsReplyAndChargesKnownUsage() {
+        assertCompletionAcrossRoomEnd(false, "STUDY_SESSION_ENDED");
+    }
+
+    @Test
+    void roomEndingAfterCommittedCompletionKeepsItsOriginalReply() {
+        assertCompletionAcrossRoomEnd(true, null);
+    }
+
+    private void assertCompletionAcrossRoomEnd(boolean commitFirstAttempt, String expectedFailureCode) {
+        scopes.add(CONFIG_SCOPE);
+        UUID user = user();
+        var room = studies.start(user, UUID.randomUUID(), null).session();
+        var request = new ChatDto.Request(UUID.randomUUID(), "책을 읽을래요", room.id(), null, List.of("JOY"));
+        var calls = new AtomicInteger();
+        var completionAttempts = new AtomicInteger();
+        var completion = new TransactionTemplate(transactions) {
+            @Override public <T> T execute(TransactionCallback<T> callback) {
+                if (completionAttempts.incrementAndGet() != 1) return super.execute(callback);
+                super.execute(status -> {
+                    callback.doInTransaction(status);
+                    if (!commitFirstAttempt) status.setRollbackOnly();
+                    return null;
+                });
+                studies.transition(user, room.id(), "END", room.version(), "USER_STOPPED");
+                throw new DataAccessResourceFailureException("completion interrupted");
+            }
+        };
+        ChatProvider provider = provider(calls::incrementAndGet, SOL_62_QUOTE, SOL_62_USAGE);
+
+        ChatDto.Exchange result = chat(provider, configuredBudget, completion).create(user, request);
+        assertEquals(expectedFailureCode == null ? "SUCCEEDED" : "FAILED", result.status());
+        assertEquals(expectedFailureCode, result.failureCode());
+        assertEquals(result, chat(provider, configuredBudget).create(user, request));
+        assertEquals(2, completionAttempts.get());
+        assertEquals(1, calls.get());
+        assertSol62Charge(user, request.clientRequestId());
+    }
+
+    @Test
+    void sustainedCompletionFailureSettlesActualSol62UsageAndDoesNotReadmitTheRequest() {
+        scopes.add(CONFIG_SCOPE);
+        UUID user = user();
+        var request = request();
+        var calls = new AtomicInteger();
+        var completionAttempts = new AtomicInteger();
+        ChatProvider provider = provider(calls::incrementAndGet, SOL_62_QUOTE, SOL_62_USAGE);
+        ChatBudgetService failingBudget = failCompletionSettlement(() -> completionAttempts.incrementAndGet() > 0);
+
+        ChatDto.Exchange failed = chat(provider, failingBudget).create(user, request);
+        assertEquals("AI_USAGE_RECORD_FAILED", failed.failureCode());
+        assertEquals(request.clientRequestId(), failed.clientRequestId());
+        assertEquals("CHAT_RESULT_UNAVAILABLE", chat(provider, configuredBudget).create(user, request).failureCode());
+        assertTrue(memory.find(user, request.clientRequestId()).isEmpty());
+        assertEquals(3, completionAttempts.get());
+        assertEquals(1, calls.get());
+        assertSol62Charge(user, request.clientRequestId());
+    }
+
+    @Test
+    void repeatedLostCommitAcknowledgementsRecoverTheCommittedExchangeAndChargeOnlyOnce() {
+        scopes.add(CONFIG_SCOPE);
+        UUID user = user();
+        var request = request();
+        var calls = new AtomicInteger();
+        var completionAttempts = new AtomicInteger();
+        var commit = new TransactionTemplate(transactions) {
+            @Override public <T> T execute(TransactionCallback<T> callback) {
+                super.execute(callback);
+                completionAttempts.incrementAndGet();
+                throw new DataAccessResourceFailureException("lost commit acknowledgement");
+            }
+        };
+        ChatProvider provider = provider(calls::incrementAndGet, SOL_62_QUOTE, SOL_62_USAGE);
+
+        ChatDto.Exchange result = chat(provider, configuredBudget, commit).create(user, request);
+        assertEquals("SUCCEEDED", result.status());
+        assertEquals(result, chat(provider, configuredBudget).create(user, request));
+        assertEquals(3, completionAttempts.get());
+        assertEquals(1, calls.get());
+        assertSol62Charge(user, request.clientRequestId());
+    }
+
+    @Test
+    void sustainedMemoryWriteFailureSettlesActualUsageOutsideTheCompletionTransaction() {
+        scopes.add(CONFIG_SCOPE);
+        UUID user = user();
+        var request = request();
+        var calls = new AtomicInteger();
+        ChatProvider provider = provider(calls::incrementAndGet, SOL_62_QUOTE, SOL_62_USAGE);
+        ChatMemoryService failingMemory = mock(ChatMemoryService.class, delegatesTo(memory));
+        doThrow(new DataAccessResourceFailureException("conversation storage unavailable")).when(failingMemory)
+                .save(eq(user), eq(request), any(), anyString());
+        ChatService service = chat(provider, configuredBudget, new TransactionTemplate(transactions), failingMemory);
+
+        ChatDto.Exchange failed = service.create(user, request);
+        assertEquals("CHAT_MEMORY_WRITE_FAILED", failed.failureCode());
+        assertEquals(request.clientRequestId(), failed.clientRequestId());
+        assertEquals("CHAT_RESULT_UNAVAILABLE", chat(provider, configuredBudget).create(user, request).failureCode());
+        assertTrue(memory.find(user, request.clientRequestId()).isEmpty());
+        verify(failingMemory, times(3)).save(eq(user), eq(request), any(), anyString());
+        assertEquals(1, calls.get());
+        assertSol62Charge(user, request.clientRequestId());
+    }
+
+    @Test
+    void knownNonbillableProviderFailureSettlesAtZeroWhenHistoryWriteFails() {
+        scopes.add(CONFIG_SCOPE);
+        UUID user = user();
+        var request = request();
+        var calls = new AtomicInteger();
+        ChatProvider provider = provider(() -> {
+            calls.incrementAndGet();
+            throw new ChatProviderException("AI_PROVIDER_FAILED", false, null);
+        }, SOL_62_QUOTE, null);
+        ChatMemoryService failingMemory = mock(ChatMemoryService.class, delegatesTo(memory));
+        doThrow(new DataAccessResourceFailureException("conversation storage unavailable")).when(failingMemory)
+                .save(eq(user), eq(request), any(), anyString());
+        ChatService service = chat(provider, configuredBudget, new TransactionTemplate(transactions), failingMemory);
+
+        ChatDto.Exchange failed = service.create(user, request);
+        assertEquals("CHAT_MEMORY_WRITE_FAILED", failed.failureCode());
+        assertEquals(request.clientRequestId(), failed.clientRequestId());
+        assertEquals("REJECTED", jdbc.queryForObject("SELECT status FROM chat_usage_events "
                 + "WHERE scope=? AND client_request_id=?", String.class, CONFIG_SCOPE, request.clientRequestId().toString()));
-        assertEquals(new BigDecimal("0.000030000"), configuredBudget.usage(user).daily().estimatedUsd());
+        assertEquals(0L, jdbc.queryForObject("SELECT charged_nano_usd FROM chat_spend_periods "
+                + "WHERE scope=? AND period_kind='DAY'", Long.class, CONFIG_SCOPE));
         assertEquals(new BigDecimal("0.000000000"), configuredBudget.usage(user).daily().reservedUsd());
         assertEquals("CHAT_RESULT_UNAVAILABLE", chat(provider, configuredBudget).create(user, request).failureCode());
         assertTrue(memory.find(user, request.clientRequestId()).isEmpty());
+        verify(failingMemory, times(3)).save(eq(user), eq(request), any(), anyString());
+        assertEquals(1, configuredBudget.usage(user).daily().requests());
         assertEquals(1, calls.get());
+    }
+
+    @Test
+    void accountDeletionDuringProviderCallKeepsUsageButLeavesNoReplyForEitherOwner() {
+        scopes.add(CONFIG_SCOPE);
+        UUID deletedOwner = user();
+        UUID otherOwner = user();
+        var request = request();
+        var calls = new AtomicInteger();
+        ChatProvider provider = provider(() -> {
+            if (calls.getAndIncrement() == 0) identities.deleteCurrentUser(deletedOwner);
+        }, SOL_62_QUOTE, SOL_62_USAGE);
+        ChatService service = chat(provider, configuredBudget);
+
+        assertEquals("AUTH_REQUIRED", assertThrows(ApiException.class, () -> service.create(deletedOwner, request)).code());
+        assertTrue(memory.find(deletedOwner, request.clientRequestId()).isEmpty());
+        assertTrue(service.recover(otherOwner, request.clientRequestId()).items().isEmpty());
+        assertEquals("SETTLED", jdbc.queryForObject("SELECT status FROM chat_usage_events "
+                + "WHERE scope=? AND client_request_id=?", String.class, CONFIG_SCOPE, request.clientRequestId().toString()));
+        assertEquals(188_000L, jdbc.queryForObject("SELECT charged_nano_usd FROM chat_spend_periods "
+                + "WHERE scope=? AND period_kind='DAY'", Long.class, CONFIG_SCOPE));
+        assertNull(jdbc.queryForObject("SELECT request_hash FROM chat_usage_events "
+                + "WHERE scope=? AND client_request_id=?", String.class, CONFIG_SCOPE, request.clientRequestId().toString()));
+        assertEquals("SUCCEEDED", service.create(otherOwner, request).status());
+        assertEquals(2, calls.get());
+    }
+
+    private ChatBudgetService failCompletionSettlement(BooleanSupplier fail) {
+        ChatBudgetService failingBudget = mock(ChatBudgetService.class, delegatesTo(configuredBudget));
+        doAnswer(call -> {
+            configuredBudget.settle(call.getArgument(0), call.getArgument(1), call.getArgument(2), call.getArgument(3));
+            if (TransactionSynchronizationManager.isActualTransactionActive() && fail.getAsBoolean()) {
+                throw new DataAccessResourceFailureException("completion transaction interrupted");
+            }
+            return null;
+        }).when(failingBudget).settle(any(), any(), anyBoolean(), isNull());
+        return failingBudget;
+    }
+
+    private void assertSol62Charge(UUID user, UUID requestId) {
+        assertEquals("SETTLED", jdbc.queryForObject("SELECT status FROM chat_usage_events "
+                + "WHERE scope=? AND client_request_id=?", String.class, CONFIG_SCOPE, requestId.toString()));
+        assertEquals(30L, jdbc.queryForObject("SELECT cached_input_tokens FROM chat_usage_events "
+                + "WHERE scope=? AND client_request_id=?", Long.class, CONFIG_SCOPE, requestId.toString()));
+        assertEquals(30L, jdbc.queryForObject("SELECT cache_write_input_tokens FROM chat_usage_events "
+                + "WHERE scope=? AND client_request_id=?", Long.class, CONFIG_SCOPE, requestId.toString()));
+        assertEquals(new BigDecimal("0.000188000"), configuredBudget.usage(user).daily().estimatedUsd());
+        assertEquals(new BigDecimal("0.000000000"), configuredBudget.usage(user).daily().reservedUsd());
+        assertEquals(1, configuredBudget.usage(user).daily().requests());
+        assertEquals(188_000L, jdbc.queryForObject("SELECT charged_nano_usd FROM chat_spend_periods "
+                + "WHERE scope=? AND period_kind='DAY'", Long.class, CONFIG_SCOPE));
     }
 
     private ChatDto.Request request() {
@@ -206,19 +458,32 @@ class ChatBudgetIntegrationTest {
     }
 
     private ChatService chat(ChatProvider provider, ChatBudgetService budget) {
+        return chat(provider, budget, new TransactionTemplate(transactions));
+    }
+
+    private ChatService chat(ChatProvider provider, ChatBudgetService budget, TransactionTemplate completion) {
+        return chat(provider, budget, completion, memory);
+    }
+
+    private ChatService chat(ChatProvider provider, ChatBudgetService budget, TransactionTemplate completion,
+                             ChatMemoryService chatMemory) {
         @SuppressWarnings("unchecked") ObjectProvider<ChatProvider> providers = mock(ObjectProvider.class);
         when(providers.getIfAvailable()).thenReturn(provider);
-        return new ChatService(jdbc, clock, providers, budget, memory, new TransactionTemplate(transactions), 30);
+        return new ChatService(jdbc, clock, providers, budget, chatMemory, completion, 30);
     }
 
     private ChatProvider provider(Runnable beforeReply) {
+        return provider(beforeReply, QUOTE, new ChatProvider.Usage(10, 2, 3));
+    }
+
+    private ChatProvider provider(Runnable beforeReply, ChatProvider.CostQuote cost, ChatProvider.Usage usage) {
         return new ChatProvider() {
             @Override public CostQuote quote(String user, String previous, String assistant, List<String> keys) {
-                return QUOTE;
+                return cost;
             }
             @Override public Reply generate(String user, String previous, String assistant, List<String> keys) {
                 beforeReply.run();
-                return new Reply(List.of(new Utterance("JOY", "같이 시작해 보자.")), new Usage(10, 2, 3));
+                return new Reply(List.of(new Utterance("JOY", "같이 시작해 보자.")), usage);
             }
         };
     }

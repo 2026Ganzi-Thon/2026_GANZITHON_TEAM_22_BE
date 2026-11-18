@@ -15,12 +15,22 @@ import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
+import java.sql.SQLException;
+import java.sql.SQLRecoverableException;
+import java.sql.SQLTransientException;
 import java.util.HexFormat;
+import java.util.function.Supplier;
 import kr.ganzithon.backend.common.ApiException;
 import kr.ganzithon.backend.common.PortableJdbc;
+import kr.ganzithon.backend.common.SafeExceptionLogger;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.dao.DataAccessResourceFailureException;
+import org.springframework.dao.RecoverableDataAccessException;
+import org.springframework.dao.TransientDataAccessException;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Service;
@@ -29,11 +39,13 @@ import org.springframework.transaction.support.TransactionTemplate;
 /** Durable user-owned conversation memory with a bounded process-local result cache. */
 @Service
 public class ChatService {
+    private static final Logger log = LoggerFactory.getLogger(ChatService.class);
     private static final Duration RETENTION = Duration.ofMinutes(15);
     private static final int MAX_FRESH_EXCHANGES = 1024;
     private static final int MAX_TRANSCRIPT_TURNS = 8;
     private static final int MAX_TRANSCRIPT_UTF8_BYTES = 20_000;
     private static final int MAX_PER_USER_PER_MINUTE = 10;
+    private static final int DB_ATTEMPTS = 3;
 
     private record Key(UUID userId, UUID requestId) { }
     private final PortableJdbc jdbc;
@@ -106,6 +118,10 @@ public class ChatService {
     }
 
     public ChatDto.Exchange create(UUID userId, ChatDto.Request request) {
+        return create(userId, request, null);
+    }
+
+    ChatDto.Exchange create(UUID userId, ChatDto.Request request, String requestId) {
         Key key = new Key(userId, request.clientRequestId());
         ChatProvider model;
         Entry entry;
@@ -197,7 +213,9 @@ public class ChatService {
 
         List<ChatDto.Utterance> utterances = List.of();
         String failureCode = null;
+        boolean failureLogged = false;
         ChatBudgetService.Reservation reservation = null;
+        UUID admissionId = null;
         ChatProvider.Usage usage = null;
         boolean chargeableUnknown = false;
         try {
@@ -210,7 +228,10 @@ public class ChatService {
             ChatProvider.CostQuote quote = model.quote(turn);
             if (quote != null) {
                 if (budget == null) throw new IllegalStateException("Missing AI budget service");
-                reservation = budget.reserve(userId, request.clientRequestId(), fingerprint(request), quote);
+                String requestHash = fingerprint(request);
+                admissionId = UUID.randomUUID();
+                reservation = budget.reserve(userId, request.clientRequestId(), requestHash, quote, admissionId);
+                admissionId = null;
                 // From this point an interrupted call may still be billed upstream.
                 chargeableUnknown = true;
             }
@@ -233,65 +254,159 @@ public class ChatService {
                 var saved = memory == null ? null : memory.find(userId, request.clientRequestId()).orElse(null);
                 if (saved != null) return saved.exchange();
                 // An abandoned request must not create a failed history row that shadows a late result.
+                SafeExceptionLogger.event(log, requestId, ex.code());
                 return failed(entry, ex.code());
             }
             failureCode = ex.code();
         } catch (RuntimeException ex) {
-            // Do not reveal provider messages or prompt contents to the mobile client.
+            if (admissionId != null) {
+                rejectUnstartedAdmission(admissionId, requestId);
+                synchronized (this) {
+                    entries.remove(key, entry);
+                    inFlight.remove(userId, key);
+                }
+                SafeExceptionLogger.log(log, requestId, "CHAT_ADMISSION_UNAVAILABLE", ex);
+                throw new ApiException(503, "CHAT_ADMISSION_UNAVAILABLE", "Could not confirm AI request admission", true);
+            }
             failureCode = "AI_PROVIDER_FAILED";
+            SafeExceptionLogger.log(log, requestId, failureCode, ex);
+            failureLogged = true;
         }
 
-        // Account deletion may have happened while the external provider was running.
-        boolean stillOwned = userExists(userId);
-        boolean roomStillActive = request.studySessionId() == null || activeRoomExists(userId, request.studySessionId());
-        synchronized (this) {
-            inFlight.remove(userId, key);
-            if (entries.get(key) != entry || !stillOwned) {
-                entries.remove(key, entry);
-                settleDeletedAccount(reservation, usage, chargeableUnknown, failureCode);
-                throw new ApiException(401, "AUTH_REQUIRED", "Account is no longer available");
-            }
-            if (failureCode == null && !roomStillActive) failureCode = "STUDY_SESSION_ENDED";
-            if (failureCode == null && clock.instant().isAfter(entry.createdAt.plus(responseDeadline))) {
-                failureCode = "CHAT_DEADLINE_EXCEEDED";
-            }
-            entry.utterances = failureCode == null ? utterances : List.of();
-            entry.failureCode = failureCode;
-            entry.status = failureCode == null ? "SUCCEEDED" : "FAILED";
-            entry.finishedAt = clock.instant();
-            entry.completedOrder = ++completionOrder;
-            try {
-                ChatDto.Exchange result = persistResult(userId, entry, reservation, usage, chargeableUnknown);
-                if (!result.id().equals(entry.id)) entries.remove(key, entry);
-                return result;
-            } catch (ApiException ex) {
-                entries.remove(key, entry);
-                if (ex.status() == 401) {
-                    settleDeletedAccount(reservation, usage, chargeableUnknown, failureCode);
-                    throw ex;
+        try {
+            Completion completion = complete(entry, utterances, failureCode, failureLogged,
+                    reservation, usage, chargeableUnknown, requestId);
+            synchronized (this) {
+                if (entries.get(key) != entry) throw accountUnavailable();
+                ChatDto.Exchange result = completion.result();
+                if (completion.retained() && result.id().equals(entry.id)) {
+                    entry.utterances = result.utterances();
+                    entry.failureCode = result.failureCode();
+                    entry.status = result.status();
+                    entry.finishedAt = result.finishedAt();
+                    entry.completedOrder = ++completionOrder;
+                } else {
+                    entries.remove(key);
                 }
-                return failed(entry, "AI_USAGE_RECORD_FAILED".equals(ex.code()) ? ex.code() : "CHAT_MEMORY_WRITE_FAILED");
-            } catch (RuntimeException ex) {
-                entries.remove(key, entry);
-                return failed(entry, "CHAT_MEMORY_WRITE_FAILED");
+                inFlight.remove(userId, key);
+                return result;
+            }
+        } finally {
+            synchronized (this) {
+                if (entries.get(key) == entry && "PROCESSING".equals(entry.status)) {
+                    entries.remove(key);
+                    inFlight.remove(userId, key);
+                }
             }
         }
     }
 
-    private ChatDto.Exchange persistResult(UUID userId, Entry entry, ChatBudgetService.Reservation reservation,
-                                            ChatProvider.Usage usage, boolean chargeableUnknown) {
+    private void rejectUnstartedAdmission(UUID admissionId, String requestId) {
+        try {
+            retryTransientDatabase(() -> {
+                budget.rejectUnstartedAdmission(admissionId);
+                return null;
+            });
+        } catch (RuntimeException ex) {
+            SafeExceptionLogger.log(log, requestId, "AI_USAGE_RECORD_FAILED", ex);
+        }
+    }
+
+    private record Completion(ChatDto.Exchange result, boolean retained) { }
+
+    private Completion complete(Entry entry, List<ChatDto.Utterance> utterances,
+                                String failureCode, boolean failureLogged, ChatBudgetService.Reservation reservation,
+                                ChatProvider.Usage usage, boolean chargeableUnknown, String requestId) {
+        UUID userId = entry.userId;
+        UUID sessionId = entry.request.studySessionId();
+        // Account deletion may have happened while the external provider was running.
+        boolean stillOwned;
+        boolean roomStillActive;
+        try {
+            stillOwned = retryTransientDatabase(() -> userExists(userId));
+            roomStillActive = stillOwned && (sessionId == null
+                    || retryTransientDatabase(() -> activeRoomExists(userId, sessionId)));
+        } catch (RuntimeException ex) {
+            SafeExceptionLogger.log(log, requestId, "CHAT_MEMORY_WRITE_FAILED", ex);
+            settleAfterStorageFailure(reservation, usage, chargeableUnknown, failureCode, requestId);
+            return new Completion(failed(entry, "CHAT_MEMORY_WRITE_FAILED"), false);
+        }
+        if (!stillOwned) {
+            settlePaidUsage(reservation, usage, chargeableUnknown, failureCode, requestId);
+            throw accountUnavailable();
+        }
+        if (failureCode == null && !roomStillActive) failureCode = "STUDY_SESSION_ENDED";
+        if (failureCode == null && clock.instant().isAfter(entry.createdAt.plus(responseDeadline))) {
+            failureCode = "CHAT_DEADLINE_EXCEEDED";
+        }
+        if (failureCode != null && !failureLogged) SafeExceptionLogger.event(log, requestId, failureCode);
+        ChatDto.Exchange pending = failureCode == null
+                ? new ChatDto.Exchange(entry.id, entry.request.clientRequestId(), sessionId, "SUCCEEDED",
+                        utterances, null, entry.createdAt, clock.instant())
+                : failed(entry, failureCode);
+        try {
+            ChatDto.Exchange result = retryTransientDatabase(
+                    () -> persistResult(entry, pending, reservation, usage, chargeableUnknown));
+            if (failureCode == null && "STUDY_SESSION_ENDED".equals(result.failureCode())) {
+                SafeExceptionLogger.event(log, requestId, result.failureCode());
+            }
+            return new Completion(result, true);
+        } catch (RuntimeException ex) {
+            if (ex instanceof ApiException api && api.status() == 401) {
+                settlePaidUsage(reservation, usage, chargeableUnknown, failureCode, requestId);
+                throw api;
+            }
+            settleAfterStorageFailure(reservation, usage, chargeableUnknown, failureCode, requestId);
+            if (transientDatabaseFailure(ex)) {
+                ChatDto.Exchange committed = findCommittedResult(userId, entry, requestId);
+                if (committed != null) return new Completion(committed, true);
+            }
+            String code = ex instanceof ApiException api && "AI_USAGE_RECORD_FAILED".equals(api.code())
+                    ? api.code() : "CHAT_MEMORY_WRITE_FAILED";
+            SafeExceptionLogger.log(log, requestId, code, ex);
+            return new Completion(failed(entry, code), false);
+        }
+    }
+
+    private static ApiException accountUnavailable() {
+        return new ApiException(401, "AUTH_REQUIRED", "Account is no longer available");
+    }
+
+    private ChatDto.Exchange persistResult(Entry entry, ChatDto.Exchange pending,
+                                           ChatBudgetService.Reservation reservation, ChatProvider.Usage usage,
+                                           boolean chargeableUnknown) {
         if (memory == null) {
-            settleUsage(reservation, usage, chargeableUnknown, entry.failureCode);
-            return entry.view();
+            settleUsage(reservation, usage, chargeableUnknown, pending.failureCode());
+            return pending;
         }
         String requestHash = fingerprint(entry.request);
-        if (reservation == null) return memory.save(userId, entry.request, entry.view(), requestHash).exchange();
+        if (reservation == null) return saveResult(entry, pending, requestHash).exchange();
         return transactions.execute(status -> {
             // Saving locks the owner before settlement locks billing, in the same order as admission.
-            var saved = memory.save(userId, entry.request, entry.view(), requestHash);
-            settleUsage(reservation, usage, chargeableUnknown, entry.failureCode);
+            var saved = saveResult(entry, pending, requestHash);
+            settleUsage(reservation, usage, chargeableUnknown, saved.exchange().failureCode());
             return saved.exchange();
         });
+    }
+
+    private ChatMemoryService.Saved saveResult(Entry entry, ChatDto.Exchange result, String requestHash) {
+        return result.studySessionId() == null
+                ? memory.save(entry.userId, entry.request, result, requestHash)
+                : memory.saveForActiveRoom(entry.userId, entry.request, result, requestHash);
+    }
+
+    private ChatDto.Exchange findCommittedResult(UUID userId, Entry entry, String requestId) {
+        if (memory == null) return null;
+        try {
+            // A commit acknowledgment can be lost even though the result and usage are already durable.
+            return retryTransientDatabase(() -> memory.find(userId, entry.request.clientRequestId()))
+                    .filter(saved -> saved.request().equals(entry.request))
+                    .map(ChatMemoryService.Saved::exchange)
+                    .orElse(null);
+        } catch (RuntimeException ex) {
+            SafeExceptionLogger.log(log, requestId, "CHAT_HISTORY_UNAVAILABLE", ex);
+            return null;
+        }
     }
 
     private void settleUsage(ChatBudgetService.Reservation reservation, ChatProvider.Usage usage,
@@ -300,17 +415,58 @@ public class ChatService {
         try {
             budget.settle(reservation, usage, chargeableUnknown, failureCode);
         } catch (RuntimeException ex) {
-            throw new ApiException(503, "AI_USAGE_RECORD_FAILED", "AI usage could not be recorded");
+            ApiException failure = new ApiException(503, "AI_USAGE_RECORD_FAILED", "AI usage could not be recorded");
+            failure.initCause(ex);
+            throw failure;
         }
     }
 
-    private void settleDeletedAccount(ChatBudgetService.Reservation reservation, ChatProvider.Usage usage,
-                                     boolean chargeableUnknown, String failureCode) {
-        try {
-            settleUsage(reservation, usage, chargeableUnknown, failureCode);
-        } catch (ApiException ex) {
-            // The abandoned reservation is still available for conservative settlement.
+    private void settleAfterStorageFailure(ChatBudgetService.Reservation reservation, ChatProvider.Usage usage,
+                                           boolean chargeableUnknown, String failureCode, String requestId) {
+        if (usage != null || !chargeableUnknown) {
+            settlePaidUsage(reservation, usage, chargeableUnknown, failureCode, requestId);
         }
+    }
+
+    private void settlePaidUsage(ChatBudgetService.Reservation reservation, ChatProvider.Usage usage,
+                                 boolean chargeableUnknown, String failureCode, String requestId) {
+        if (reservation == null) return;
+        try {
+            // The save transaction has already ended. Settlement is idempotent by reservation ID.
+            retryTransientDatabase(() -> {
+                settleUsage(reservation, usage, chargeableUnknown, failureCode);
+                return null;
+            });
+        } catch (ApiException ex) {
+            // The reservation remains available for conservative stale-reservation settlement.
+            SafeExceptionLogger.log(log, requestId, ex.code(), ex);
+        }
+    }
+
+    private static <T> T retryTransientDatabase(Supplier<T> operation) {
+        for (int attempt = 1; ; attempt++) {
+            try {
+                return operation.get();
+            } catch (RuntimeException ex) {
+                if (attempt >= DB_ATTEMPTS || !transientDatabaseFailure(ex)) throw ex;
+            }
+        }
+    }
+
+    private static boolean transientDatabaseFailure(Throwable error) {
+        boolean transientFailure = false;
+        for (Throwable cause = error; cause != null; cause = cause.getCause()) {
+            if (cause instanceof SQLException sql && sql.getErrorCode() == 1205) return false;
+            if (cause instanceof TransientDataAccessException
+                    || cause instanceof RecoverableDataAccessException
+                    || cause instanceof DataAccessResourceFailureException
+                    || cause instanceof SQLTransientException || cause instanceof SQLRecoverableException) {
+                transientFailure = true;
+            }
+            if (cause instanceof SQLException sql && sql.getSQLState() != null
+                    && sql.getSQLState().startsWith("08")) transientFailure = true;
+        }
+        return transientFailure;
     }
 
     private ChatDto.Exchange failed(Entry entry, String code) {

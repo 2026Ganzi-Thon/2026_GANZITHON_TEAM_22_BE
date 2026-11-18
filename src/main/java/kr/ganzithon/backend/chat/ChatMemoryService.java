@@ -80,6 +80,16 @@ public class ChatMemoryService {
     /** Same request key and fingerprint replay the original result; a changed request conflicts. */
     @Transactional
     public Saved save(UUID userId, ChatDto.Request request, ChatDto.Exchange exchange, String requestHash) {
+        return save(userId, request, exchange, requestHash, false);
+    }
+
+    @Transactional
+    public Saved saveForActiveRoom(UUID userId, ChatDto.Request request, ChatDto.Exchange exchange, String requestHash) {
+        return save(userId, request, exchange, requestHash, true);
+    }
+
+    private Saved save(UUID userId, ChatDto.Request request, ChatDto.Exchange exchange,
+                       String requestHash, boolean verifyActiveRoom) {
         if (userId == null || request == null || exchange == null || request.clientRequestId() == null
                 || exchange.id() == null || exchange.createdAt() == null || exchange.finishedAt() == null
                 || !("SUCCEEDED".equals(exchange.status()) || "FAILED".equals(exchange.status()))
@@ -99,6 +109,14 @@ public class ChatMemoryService {
                 throw new ApiException(409, "CLIENT_REQUEST_ID_REUSED", "Request identifier was reused with different content");
             }
             return previous.get();
+        }
+        UUID sessionId = request.studySessionId();
+        if (verifyActiveRoom && sessionId != null && "SUCCEEDED".equals(exchange.status())
+                && jdbc.queryForList("SELECT id FROM study_sessions WHERE id = ? AND user_id = ? "
+                        + "AND status IN ('STUDYING', 'PAUSED')", UUID.class, sessionId, userId).isEmpty()) {
+            // Study transitions use the same owner lock. Existing committed results replay above.
+            exchange = new ChatDto.Exchange(exchange.id(), exchange.clientRequestId(), sessionId,
+                    "FAILED", List.of(), "STUDY_SESSION_ENDED", exchange.createdAt(), exchange.finishedAt());
         }
         byte[] bytes = serialize(new Payload(request, exchange));
         if (bytes.length == 0 || bytes.length > MAX_PAYLOAD_BYTES) {
@@ -452,7 +470,9 @@ public class ChatMemoryService {
         try {
             return query.get();
         } catch (DataAccessResourceFailureException | RecoverableDataAccessException | TransientDataAccessException exception) {
-            throw unavailable();
+            ApiException failure = unavailable();
+            failure.initCause(exception);
+            throw failure;
         }
     }
 }

@@ -2,7 +2,8 @@ package kr.ganzithon.backend.common;
 
 import jakarta.servlet.http.HttpServletRequest;
 import jakarta.validation.ConstraintViolationException;
-import org.springframework.dao.DataIntegrityViolationException;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
@@ -19,13 +20,17 @@ import org.springframework.web.HttpMediaTypeNotSupportedException;
 
 @RestControllerAdvice
 public class ApiErrorHandler {
+    private static final Logger log = LoggerFactory.getLogger(ApiErrorHandler.class);
+
     @ExceptionHandler(ApiException.class)
     ResponseEntity<ApiError> api(ApiException ex, HttpServletRequest request) {
+        if (ex.status() >= 500 && !"CHAT_NOT_CONFIGURED".equals(ex.code()))
+            SafeExceptionLogger.log(log, requestId(request), ex.code(), ex);
         return error(ex.status(), ex.code(), ex.getMessage(), request, ex.retryable());
     }
     @ExceptionHandler({HttpMessageNotReadableException.class, MethodArgumentNotValidException.class,
         ConstraintViolationException.class, MethodArgumentTypeMismatchException.class,
-        MissingServletRequestParameterException.class, IllegalArgumentException.class})
+        MissingServletRequestParameterException.class})
     ResponseEntity<ApiError> input(Exception ex, HttpServletRequest request) {
         return error(400, "VALIDATION_FAILED", "요청 형식이나 값이 올바르지 않습니다.", request);
     }
@@ -49,12 +54,9 @@ public class ApiErrorHandler {
     ResponseEntity<ApiError> unacceptableMedia(HttpMediaTypeNotAcceptableException ex, HttpServletRequest request) {
         return error(406, "NOT_ACCEPTABLE", "응답 형식은 application/json을 허용해 주세요.", request);
     }
-    @ExceptionHandler(DataIntegrityViolationException.class)
-    ResponseEntity<ApiError> conflict(Exception ex, HttpServletRequest request) {
-        return error(409, "DATA_CONFLICT", "현재 데이터와 요청이 충돌합니다.", request);
-    }
     @ExceptionHandler(Exception.class)
     ResponseEntity<ApiError> unexpected(Exception ex, HttpServletRequest request) {
+        SafeExceptionLogger.log(log, requestId(request), "INTERNAL_ERROR", ex);
         return error(500, "INTERNAL_ERROR", "처리 중 오류가 발생했습니다.", request);
     }
     private ResponseEntity<ApiError> error(int status, String code, String message, HttpServletRequest request) {
@@ -66,6 +68,10 @@ public class ApiErrorHandler {
             response.header(HttpHeaders.RETRY_AFTER, "60");
         }
         return response.contentType(MediaType.APPLICATION_JSON).body(new ApiError(code, message,
-            String.valueOf(request.getAttribute("requestId")), retryable));
+            requestId(request), retryable));
+    }
+
+    private static String requestId(HttpServletRequest request) {
+        return String.valueOf(request.getAttribute("requestId"));
     }
 }

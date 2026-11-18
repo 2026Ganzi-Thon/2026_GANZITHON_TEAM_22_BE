@@ -127,7 +127,7 @@ class IdentityDeletionIntegrationTest {
         try {
             jdbc.update("INSERT INTO deletion_test_guard(user_id) VALUES (?)", owner.id().toString());
             mvc.perform(delete("/api/v1/me").header("Authorization", bearer(owner.token())))
-                    .andExpect(status().isConflict()).andExpect(jsonPath("$.code").value("DATA_CONFLICT"));
+                    .andExpect(status().isInternalServerError()).andExpect(jsonPath("$.code").value("INTERNAL_ERROR"));
             mvc.perform(get("/api/v1/me").header("Authorization", bearer(owner.token())))
                     .andExpect(status().isOk());
             mvc.perform(get("/api/v1/tasks/" + task.path("id").asText())

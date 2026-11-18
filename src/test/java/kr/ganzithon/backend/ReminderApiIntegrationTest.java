@@ -3,7 +3,16 @@ package kr.ganzithon.backend;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import java.time.Instant;
+import java.time.OffsetDateTime;
 import java.util.UUID;
+import java.util.concurrent.Callable;
+import java.util.concurrent.CyclicBarrier;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
+import kr.ganzithon.backend.common.ApiException;
+import kr.ganzithon.backend.reminder.ReminderService;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -30,8 +39,51 @@ class ReminderApiIntegrationTest {
     @Autowired MockMvc mvc;
     @Autowired ObjectMapper mapper;
     @Autowired BackendApiIntegrationTest.MutableClock clock;
+    @Autowired ReminderService reminders;
 
     @BeforeEach void reset() { clock.set(Instant.parse("2026-11-03T00:00:00Z")); }
+
+    @Test void accountDeletedAfterAuthenticationReturnsUnauthorized() throws Exception {
+        String token = guest();
+        UUID authenticatedUser = UUID.fromString(authorized(get("/api/v1/me"), token, null, 200)
+                .required("userId").asText());
+        String source = study(token);
+        end(token, source);
+        authorized(delete("/api/v1/me"), token, null, 204);
+
+        // Exercise the reservation after the authentication filter has resolved the owner.
+        OffsetDateTime remindAt = OffsetDateTime.parse("2026-11-04T00:00:00Z");
+        ApiException failure = assertThrows(ApiException.class,
+                () -> reminders.put(authenticatedUser, UUID.fromString(source), remindAt, "Asia/Seoul"));
+        assertEquals(401, failure.status());
+        assertEquals("AUTH_REQUIRED", failure.code());
+    }
+
+    @Test void concurrentRequestsForTheSameStudyReturnOneReminder() throws Exception {
+        String token = guest();
+        UUID userId = UUID.fromString(authorized(get("/api/v1/me"), token, null, 200)
+                .required("userId").asText());
+        String source = study(token);
+        end(token, source);
+        UUID sourceId = UUID.fromString(source);
+        OffsetDateTime remindAt = OffsetDateTime.parse("2026-11-04T00:00:00Z");
+        ExecutorService workers = Executors.newFixedThreadPool(2);
+        CyclicBarrier start = new CyclicBarrier(2);
+        Callable<ReminderService.PutResult> reserve = () -> {
+            start.await(10, TimeUnit.SECONDS);
+            return reminders.put(userId, sourceId, remindAt, "Asia/Seoul");
+        };
+        try {
+            Future<ReminderService.PutResult> first = workers.submit(reserve);
+            Future<ReminderService.PutResult> second = workers.submit(reserve);
+            ReminderService.PutResult firstResult = first.get(30, TimeUnit.SECONDS);
+            ReminderService.PutResult secondResult = second.get(30, TimeUnit.SECONDS);
+            assertNotEquals(firstResult.created(), secondResult.created());
+            assertEquals(firstResult.reminder(), secondResult.reminder());
+        } finally {
+            workers.shutdownNow();
+        }
+    }
 
     @Test void reminderLifecycleAndIdempotency() throws Exception {
         String owner = guest();
@@ -57,6 +109,44 @@ class ReminderApiIntegrationTest {
         assertTrue(authorized(get("/api/v1/start-reminders/current"), owner, null, 200)
                 .path("reminder").isNull());
         assertEquals("CANCELED", putReminder(owner, path, input, 200).path("reminder").path("status").asText());
+    }
+
+    @Test void concurrentReservationsAndNextStudyStayWithTheirOwners() throws Exception {
+        String first = guest();
+        String second = guest();
+        String firstStudy = study(first);
+        String secondStudy = study(second);
+        end(first, firstStudy);
+        end(second, secondStudy);
+        String current = "/api/v1/start-reminders/current";
+        assertTrue(authorized(get(current), first, null, 200).required("reminder").isNull());
+        assertTrue(authorized(get(current), second, null, 200).required("reminder").isNull());
+
+        String body = "{\"remindAt\":\"2026-11-04T00:00:00Z\",\"timeZone\":\"Asia/Seoul\"}";
+        ExecutorService workers = Executors.newFixedThreadPool(2);
+        CyclicBarrier start = new CyclicBarrier(2);
+        String firstId;
+        String secondId;
+        try {
+            Future<JsonNode> firstReservation = workers.submit(() -> {
+                start.await(10, TimeUnit.SECONDS);
+                return putReminder(first, STUDIES + "/" + firstStudy + "/next-start-reminder", body, 201);
+            });
+            Future<JsonNode> secondReservation = workers.submit(() -> {
+                start.await(10, TimeUnit.SECONDS);
+                return putReminder(second, STUDIES + "/" + secondStudy + "/next-start-reminder", body, 201);
+            });
+            firstId = firstReservation.get(30, TimeUnit.SECONDS).required("reminder").required("id").asText();
+            secondId = secondReservation.get(30, TimeUnit.SECONDS).required("reminder").required("id").asText();
+        } finally {
+            workers.shutdownNow();
+        }
+        assertNotEquals(firstId, secondId);
+        assertEquals(firstId, authorized(get(current), first, null, 200).at("/reminder/id").asText());
+        assertEquals(secondId, authorized(get(current), second, null, 200).at("/reminder/id").asText());
+        study(first);
+        assertTrue(authorized(get(current), first, null, 200).required("reminder").isNull());
+        assertEquals(secondId, authorized(get(current), second, null, 200).at("/reminder/id").asText());
     }
 
     @Test void latestEndedSourceAndExpiry() throws Exception {

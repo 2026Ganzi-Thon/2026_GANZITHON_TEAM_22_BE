@@ -24,12 +24,15 @@ import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.stereotype.Component;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 /** Opt-in, single-call Responses API adapter. Never logs requests or upstream bodies. */
 @Component
 @ConditionalOnProperty(name = "ganzi.chat.enabled", havingValue = "true")
 @ConditionalOnProperty(name = "ganzi.chat.provider", havingValue = "openai")
 public final class OpenAiChatProvider implements ChatProvider {
+    private static final Logger log = LoggerFactory.getLogger(OpenAiChatProvider.class);
     private static final URI RESPONSES_URI = URI.create("https://api.openai.com/v1/responses");
     private static final Set<String> CHARACTER_KEYS = Set.of("ANGRY", "JOY", "SAD");
     private static final Set<String> STUDY_STATES = Set.of("HOME", "STUDYING", "PAUSED");
@@ -377,6 +380,9 @@ public final class OpenAiChatProvider implements ChatProvider {
             mapped = "AI_UPSTREAM_QUOTA_EXCEEDED";
         } else if (status == 429 || "rate_limit_error".equals(type)) mapped = "AI_UPSTREAM_RATE_LIMITED";
         else mapped = "AI_PROVIDER_FAILED";
+        // Only a numeric HTTP status and our fixed public code reach the log. The
+        // upstream error body can contain user data, credentials, or arbitrary text.
+        log.warn("provider=OPENAI code={} upstreamStatus={}", mapped, status);
         return failure(mapped, status >= 500, null);
     }
 

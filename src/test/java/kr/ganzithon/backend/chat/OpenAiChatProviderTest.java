@@ -1,5 +1,8 @@
 package kr.ganzithon.backend.chat;
 
+import ch.qos.logback.classic.Logger;
+import ch.qos.logback.classic.spi.ILoggingEvent;
+import ch.qos.logback.core.read.ListAppender;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.sun.net.httpserver.HttpExchange;
@@ -8,20 +11,27 @@ import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.net.URI;
 import java.net.http.HttpClient;
+import java.net.http.HttpResponse;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.CompletableFuture;
 import java.util.Map;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 import kr.ganzithon.backend.common.ApiException;
 import org.junit.jupiter.api.Test;
+import org.slf4j.LoggerFactory;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.when;
 
 class OpenAiChatProviderTest {
     private final ObjectMapper mapper = new ObjectMapper();
@@ -334,6 +344,44 @@ class OpenAiChatProviderTest {
             }
             assertEquals(6, calls.get());
         } finally { server.stop(0); }
+    }
+
+    @Test
+    void upstreamHttpStatusIsDiagnosableWithoutLoggingProviderBodyOrChangingBilling() throws Exception {
+        HttpClient client = mock(HttpClient.class);
+        int[] statuses = {400, 401, 404, 500};
+        String privateMarker = "PRIVATE_PROVIDER_MESSAGE_OR_PROMPT";
+        @SuppressWarnings("unchecked")
+        HttpResponse<String> response = mock(HttpResponse.class);
+        when(response.body()).thenReturn("{\"error\":{\"message\":\"" + privateMarker + "\"}}");
+        when(client.<String>sendAsync(any(), any())).thenReturn(CompletableFuture.completedFuture(response));
+        Logger logger = (Logger) LoggerFactory.getLogger(OpenAiChatProvider.class);
+        ListAppender<ILoggingEvent> logs = new ListAppender<>();
+        logs.start();
+        logger.addAppender(logs);
+        try {
+            var provider = new OpenAiChatProvider(mapper, "test-key", "gpt-6-luna", 2,
+                1024, URI.create("https://example.invalid/v1/responses"), client);
+            for (int i = 0; i < statuses.length; i++) {
+                when(response.statusCode()).thenReturn(statuses[i]);
+                ChatProviderException failure = assertThrows(ChatProviderException.class, () ->
+                    provider.generate("안녕", null, null, keys));
+                assertEquals("AI_PROVIDER_FAILED", failure.code());
+                assertEquals(statuses[i] >= 500, failure.chargeableUnknown());
+                assertNull(failure.usage());
+                String diagnostic = logs.list.get(i).getFormattedMessage();
+                assertTrue(diagnostic.contains("code=AI_PROVIDER_FAILED"));
+                assertTrue(diagnostic.contains("upstreamStatus=" + statuses[i]));
+                assertFalse(diagnostic.contains(privateMarker));
+                assertFalse(diagnostic.contains("test-key"));
+                assertFalse(diagnostic.contains("안녕"));
+                assertNull(logs.list.get(i).getThrowableProxy());
+            }
+            assertEquals(statuses.length, logs.list.size());
+        } finally {
+            logger.detachAppender(logs);
+            logs.stop();
+        }
     }
 
     @Test

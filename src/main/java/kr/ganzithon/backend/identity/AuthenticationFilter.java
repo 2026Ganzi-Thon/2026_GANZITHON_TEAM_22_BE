@@ -9,6 +9,9 @@ import java.io.IOException;
 import java.util.UUID;
 import kr.ganzithon.backend.common.ApiError;
 import kr.ganzithon.backend.common.ApiException;
+import kr.ganzithon.backend.common.SafeExceptionLogger;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.core.Ordered;
 import org.springframework.core.annotation.Order;
@@ -17,6 +20,7 @@ import org.springframework.web.filter.OncePerRequestFilter;
 
 @Component @Order(Ordered.HIGHEST_PRECEDENCE + 2)
 public class AuthenticationFilter extends OncePerRequestFilter {
+    private static final Logger log = LoggerFactory.getLogger(AuthenticationFilter.class);
     private final IdentityService service;
     private final ObjectMapper mapper;
     private final boolean demoEnabled;
@@ -47,14 +51,26 @@ public class AuthenticationFilter extends OncePerRequestFilter {
             if ((registration && header != null) || (!open && !registration)) {
                 if(header==null || !header.startsWith("Bearer ")) throw new ApiException(401,"AUTH_REQUIRED","인증이 필요합니다.");
                 String token=header.substring(7);
-                var identity=service.authenticate(token);
+                var identity=authenticate(token,requestId);
                 req.setAttribute("identity",identity); req.setAttribute("userId",identity.userId());
                 req.setAttribute("accessToken",token);
             }
-            chain.doFilter(req,res);
         } catch(ApiException ex) {
             res.setStatus(ex.status()); res.setContentType("application/json"); res.setCharacterEncoding("UTF-8");
-            mapper.writeValue(res.getOutputStream(),new ApiError(ex.code(),ex.getMessage(),requestId,false));
+            mapper.writeValue(res.getOutputStream(),new ApiError(ex.code(),ex.getMessage(),requestId,ex.retryable()));
+            return;
+        }
+        chain.doFilter(req,res);
+    }
+
+    private IdentityService.MeDTO authenticate(String token, String requestId) {
+        try {
+            return service.authenticate(token);
+        } catch (ApiException ex) {
+            throw ex;
+        } catch (RuntimeException ex) {
+            SafeExceptionLogger.log(log, requestId, "INTERNAL_ERROR", ex);
+            throw new ApiException(500, "INTERNAL_ERROR", "처리 중 오류가 발생했습니다.");
         }
     }
 

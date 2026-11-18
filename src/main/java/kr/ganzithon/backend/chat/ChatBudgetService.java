@@ -15,6 +15,7 @@ import org.springframework.beans.factory.annotation.Value;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Propagation;
 import org.springframework.transaction.annotation.Transactional;
 
 /** Durable, conservative application spending estimates. These are not the provider's billing balance. */
@@ -61,6 +62,12 @@ public class ChatBudgetService {
 
     @Transactional
     public Reservation reserve(UUID userId, UUID requestId, String requestHash, ChatProvider.CostQuote quote) {
+        return reserve(userId, requestId, requestHash, quote, UUID.randomUUID());
+    }
+
+    @Transactional
+    public Reservation reserve(UUID userId, UUID requestId, String requestHash, ChatProvider.CostQuote quote,
+                               UUID id) {
         // Use the same owner lock order as account deletion and other owned writes.
         requireOwner(userId, true);
         lockBillingState();
@@ -112,7 +119,6 @@ public class ChatBudgetService {
         Long requests = jdbc.queryForObject("SELECT COUNT(*) FROM chat_usage_events "
                 + "WHERE scope=? AND user_id=? AND day_start=?", Long.class, scope, userId, day);
         if (requests >= userDailyLimit) throw failure("AI_DAILY_USAGE_EXCEEDED");
-        UUID id = UUID.randomUUID();
         jdbc.update("INSERT INTO chat_usage_events (id,scope,user_id,client_request_id,request_hash,model,"
                 + "day_start,month_start,reserved_nano_usd,input_nano_rate,cached_nano_rate,"
                 + "cache_write_nano_rate,output_nano_rate,max_input_tokens,max_output_tokens,status,created_at) "
@@ -129,6 +135,17 @@ public class ChatBudgetService {
     @Transactional
     public void settle(Reservation reservation, ChatProvider.Usage usage, boolean chargeableUnknown,
                        String failureCode) {
+        settleReservation(reservation.id(), usage, chargeableUnknown, failureCode, false);
+    }
+
+    /** The provider was never called. Only the reservation for this admission attempt may be released. */
+    @Transactional(propagation = Propagation.REQUIRES_NEW)
+    public void rejectUnstartedAdmission(UUID id) {
+        settleReservation(id, null, false, "CHAT_ADMISSION_UNAVAILABLE", true);
+    }
+
+    private void settleReservation(UUID id, ChatProvider.Usage usage, boolean chargeableUnknown,
+                                   String failureCode, boolean missingAllowed) {
         lockBillingState();
         List<Event> events = jdbc.query("SELECT id,day_start,month_start,reserved_nano_usd,input_nano_rate,"
                 + "COALESCE(cached_nano_rate,input_nano_rate) AS cached_nano_rate,"
@@ -139,8 +156,11 @@ public class ChatBudgetService {
                     rs.getObject("month_start", LocalDate.class), rs.getLong("reserved_nano_usd"),
                     rs.getLong("input_nano_rate"), rs.getLong("cached_nano_rate"),
                     rs.getLong("cache_write_nano_rate"), rs.getLong("output_nano_rate"), rs.getString("status")),
-                scope, reservation.id());
-        if (events.isEmpty()) throw new IllegalStateException("Missing AI spending reservation");
+                scope, id);
+        if (events.isEmpty()) {
+            if (missingAllowed) return;
+            throw new IllegalStateException("Missing AI spending reservation");
+        }
         Event event = events.getFirst();
         if (!event.status().equals("RESERVED")) return;
         settleEvent(event, usage, chargeableUnknown, failureCode);

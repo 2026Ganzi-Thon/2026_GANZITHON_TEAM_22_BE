@@ -28,6 +28,7 @@ const rootPassword = crypto.randomBytes(32).toString('hex');
 const databases = {
   integration: `ganzi_test_integration_${suffix}`,
   smoke: `ganzi_test_smoke_${suffix}`,
+  staging: `ganzi_test_staging_${suffix}`,
   migration: `ganzi_test_deploy_${suffix}_migration`,
   dirty: `ganzi_test_deploy_${suffix}_dirty`,
   upgrade: `ganzi_test_deploy_${suffix}_upgrade`,
@@ -46,7 +47,7 @@ for (const signal of ['SIGINT', 'SIGTERM']) {
   });
 }
 const result = { passed: false, startedAt: new Date().toISOString(), tests: null,
-  smoke: null, schemaParity: null, mysqlStopped: false, runDirectory: run };
+  smoke: null, stagingSmoke: null, schemaParity: null, mysqlStopped: false, runDirectory: run };
 
 function fail(message) { throw new Error(message); }
 function checkAbort() { if (abortSignal) fail(`사용자가 ${abortSignal} 신호로 검증을 중단했습니다.`); }
@@ -85,6 +86,7 @@ function copySource() {
   fs.cpSync(path.join(repo, 'gradle'), path.join(work, 'gradle'), { recursive: true });
   fs.cpSync(path.join(repo, 'src'), path.join(work, 'src'), { recursive: true });
   fs.copyFileSync(path.join(repo, 'scripts', 'smoke.mjs'), path.join(work, 'scripts', 'smoke.mjs'));
+  fs.copyFileSync(path.join(repo, 'scripts', 'staging-smoke.mjs'), path.join(work, 'scripts', 'staging-smoke.mjs'));
   fs.copyFileSync(path.join(repo, 'docs', 'implemented.openapi.json'),
     path.join(work, 'docs', 'implemented.openapi.json'));
   // The allowlist above intentionally excludes .env, data/preview, logs and any old DB.
@@ -100,7 +102,9 @@ function ownedPort() {
   // The private startup file sets a random password before the DB is used.
   // A different server on this port cannot authenticate with that password.
   const check = mysqlCommand('SELECT @@port;');
-  lastPortProbe = { status: check.status, errorCode: check.error?.code ?? null };
+  lastPortProbe = { status: check.status, errorCode: check.error?.code ?? null,
+    diagnostic: String(check.stderr ?? '').replaceAll(password, '[test-password-redacted]')
+      .replaceAll(rootPassword, '[root-password-redacted]').trim().slice(0, 400) };
   return check.status === 0 && check.stdout.trim() === String(port);
 }
 function mysqlCommand(sql, timeout = 5000) {
@@ -146,7 +150,7 @@ async function startMysql() {
     if (ownedPort()) { fs.unlinkSync(bootstrapPath); return; }
     await new Promise(resolve => setTimeout(resolve, 250));
   }
-  fail(`전용 MySQL의 고유 인증을 60초 안에 확인하지 못했습니다. 검사 상태=${lastPortProbe?.status ?? '없음'}, 오류=${lastPortProbe?.errorCode ?? '없음'}`);
+  fail(`전용 MySQL의 고유 인증을 60초 안에 확인하지 못했습니다. 검사 상태=${lastPortProbe?.status ?? '없음'}, 오류=${lastPortProbe?.errorCode ?? '없음'}, 진단=${lastPortProbe?.diagnostic ?? '없음'}`);
 }
 function writeBootstrap() {
   const names = Object.values(databases);
@@ -189,7 +193,8 @@ async function runChecked(executable, args, env, label) {
   const scrub = value => String(value ?? '').replaceAll(password, '[test-password-redacted]')
     .replaceAll(rootPassword, '[root-password-redacted]')
     .replace(/\bsk-[A-Za-z0-9_-]{12,}/g, '[api-key-redacted]');
-  const logName = label === 'Gradle' ? 'gradle.log' : 'http-smoke.log';
+  const logName = label === 'Gradle' ? 'gradle.log'
+    : label === 'Staging HTTP 점검' ? 'staging-http-smoke.log' : 'http-smoke.log';
   fs.writeFileSync(path.join(run, logName), scrub(Buffer.concat(chunks).toString('utf8')));
   if (launchError || code !== 0) fail(`${label} 실패: 종료 코드 ${code ?? '알 수 없음'}`);
 }
@@ -207,7 +212,7 @@ function summarizeTests() {
       totals[field] += Number(value);
     }
   }
-  if (totals.suites < 17 || totals.tests < 77 || totals.failures || totals.errors || totals.skipped)
+  if (totals.suites < 25 || totals.tests < 133 || totals.failures || totals.errors || totals.skipped)
     fail(`자동 시험 결과가 예상과 다릅니다: ${totals.tests}개 중 실패 ${totals.failures}, 오류 ${totals.errors}, 건너뜀 ${totals.skipped}`);
   return totals;
 }
@@ -256,7 +261,9 @@ try {
     GANZI_MIGRATION_DIRTY_DB_URL: url(databases.dirty),
     GANZI_MIGRATION_UPGRADE_DB_URL: url(databases.upgrade),
     GANZI_SMOKE_DB_URL: url(databases.smoke), GANZI_SMOKE_DB_USERNAME: user,
-    GANZI_SMOKE_DB_PASSWORD: password };
+    GANZI_SMOKE_DB_PASSWORD: password,
+    GANZI_STAGING_SMOKE_DB_URL: url(databases.staging),
+    GANZI_STAGING_SMOKE_DB_USERNAME: user, GANZI_STAGING_SMOKE_DB_PASSWORD: password };
   console.log('격리된 MySQL에서 자동 시험과 JAR 빌드를 진행합니다.');
   const offline = process.env.GANZI_GRADLE_OFFLINE === 'true' ? ['--offline'] : [];
   await runChecked(java, ['-cp', path.join(work, 'gradle', 'wrapper', 'gradle-wrapper.jar'),
@@ -268,12 +275,29 @@ try {
   await runChecked(process.execPath, [path.join(work, 'scripts', 'smoke.mjs')], env, 'HTTP 점검');
   checkAbort();
   const smoke = JSON.parse(fs.readFileSync(path.join(work, 'build', 'smoke-result.json'), 'utf8'));
-  if (!smoke.passed || smoke.implementedOperations !== 33) fail('HTTP 점검 결과가 예상과 다릅니다.');
+  if (!smoke.passed || smoke.implementedOperations !== 33 || !Array.isArray(smoke.checks)
+      || smoke.checks.length < 24) fail('HTTP 점검 결과가 예상과 다릅니다.');
   result.smoke = { passed: true, operations: smoke.implementedOperations, checks: smoke.checks.length };
+  console.log('Flyway로 생성한 빈 DB에서 staging 프로필의 핵심 HTTP 흐름을 점검합니다.');
+  await runChecked(process.execPath, [path.join(work, 'scripts', 'staging-smoke.mjs')], env, 'Staging HTTP 점검');
+  checkAbort();
+  const stagingSmoke = JSON.parse(fs.readFileSync(path.join(work, 'build', 'staging-smoke-result.json'), 'utf8'));
+  const expectedMigrations = fs.readdirSync(path.join(work, 'src', 'main', 'resources', 'db', 'migration'))
+    .filter(name => /^V\d+__.*\.sql$/.test(name)).length;
+  const migrationCheck = mysqlCommand(`SELECT COUNT(*) FROM \`${databases.staging}\`.flyway_schema_history WHERE success=1;`);
+  stagingSmoke.flywayVerified = expectedMigrations > 0 && migrationCheck.status === 0
+    && Number(migrationCheck.stdout.trim()) === expectedMigrations;
+  stagingSmoke.expectedMigrations = expectedMigrations;
+  stagingSmoke.appliedMigrations = migrationCheck.status === 0 ? Number(migrationCheck.stdout.trim()) : null;
+  if (!stagingSmoke.passed || stagingSmoke.profile !== 'staging' || !stagingSmoke.flywayVerified
+      || stagingSmoke.requestCount < 18)
+    fail('Staging HTTP 점검 결과가 예상과 다릅니다.');
+  result.stagingSmoke = stagingSmoke;
+  checkAbort();
   result.schemaParity = compareSchemaSnapshots(
-    schemaSnapshot(mysqlRows, databases.migration), schemaSnapshot(mysqlRows, databases.smoke));
+    schemaSnapshot(mysqlRows, databases.staging), schemaSnapshot(mysqlRows, databases.smoke));
   result.passed = true;
-  console.log(`HTTP API ${result.smoke.operations}개 점검 완료.`);
+  console.log(`HTTP API ${result.smoke.operations}개와 staging 핵심 흐름 및 스키마 일치 점검 완료.`);
 } catch (error) {
   result.error = String(error?.message ?? error);
   console.error(result.error);

@@ -3,14 +3,21 @@ package kr.ganzithon.backend.chat;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import java.nio.file.Path;
+import java.sql.SQLException;
 import java.time.Clock;
 import java.util.List;
 import java.util.UUID;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 import kr.ganzithon.backend.common.ApiException;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.ObjectProvider;
+import org.springframework.dao.CannotAcquireLockException;
+import org.springframework.dao.DataAccessResourceFailureException;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.jdbc.core.RowMapper;
 
@@ -140,6 +147,87 @@ class ChatServiceTest {
         assertEquals("legacy-context", received.get().memoryContext());
         assertTrue(received.get().sessionTranscript().isEmpty());
         verify(memory, never()).transcript(userId, null);
+    }
+
+    @Test
+    void transientOwnershipRecheckFailureAfterProviderPreservesTheReply() {
+        doReturn(List.of(userId)).doThrow(new DataAccessResourceFailureException("ownership read interrupted"))
+                .doReturn(List.of(userId)).when(jdbc).query(
+                        eq("SELECT id FROM users WHERE id = ?"), any(RowMapper.class), eq(userId.toString()));
+        var calls = new AtomicInteger();
+        when(available.getIfAvailable()).thenReturn((content, priorUser, priorAssistant, keys) -> {
+            calls.incrementAndGet();
+            return new ChatProvider.Reply(List.of(new ChatProvider.Utterance("JOY", "같이 시작해요.")));
+        });
+        ChatService service = new ChatService(jdbc, Clock.systemUTC(), available, 30);
+        var request = new ChatDto.Request(UUID.randomUUID(), "오늘 공부를 시작할래요", null, null, List.of("JOY"));
+
+        ChatDto.Exchange result = service.create(userId, request);
+        assertEquals("SUCCEEDED", result.status());
+        assertEquals(result, service.recover(userId, request.clientRequestId()).items().getFirst());
+        assertEquals(1, calls.get());
+    }
+
+    @Test
+    void stalledCompletionKeepsSameUserInFlightAndAllowsAnotherUserToFinish() throws Exception {
+        stubOwner();
+        UUID otherUser = UUID.randomUUID();
+        doReturn(List.of(otherUser)).when(jdbc).query(
+                eq("SELECT id FROM users WHERE id = ?"), any(RowMapper.class), eq(otherUser.toString()));
+        when(available.getIfAvailable()).thenReturn((content, priorUser, priorAssistant, keys) ->
+                new ChatProvider.Reply(List.of(new ChatProvider.Utterance("JOY", "같이 시작해요."))));
+        var retryStarted = new CountDownLatch(1);
+        var releaseRetry = new CountDownLatch(1);
+        ChatMemoryService memory = mock(ChatMemoryService.class);
+        when(memory.save(eq(userId), any(ChatDto.Request.class), any(ChatDto.Exchange.class), any(String.class)))
+                .thenThrow(new DataAccessResourceFailureException("completion interrupted"))
+                .thenAnswer(inv -> {
+                    retryStarted.countDown();
+                    assertTrue(releaseRetry.await(10, TimeUnit.SECONDS));
+                    return new ChatMemoryService.Saved(inv.getArgument(1), inv.getArgument(2), inv.getArgument(3));
+                });
+        when(memory.save(eq(otherUser), any(ChatDto.Request.class), any(ChatDto.Exchange.class), any(String.class)))
+                .thenAnswer(inv -> new ChatMemoryService.Saved(inv.getArgument(1), inv.getArgument(2), inv.getArgument(3)));
+        ChatService service = new ChatService(jdbc, Clock.systemUTC(), available, null, memory, null, 30);
+        var request = new ChatDto.Request(UUID.randomUUID(), "공부를 시작할래요", null, null, List.of("JOY"));
+        var otherRequest = new ChatDto.Request(UUID.randomUUID(), "책을 읽을래요", null, null, List.of("JOY"));
+        var workers = Executors.newFixedThreadPool(2);
+        try {
+            var pending = workers.submit(() -> service.create(userId, request));
+            assertTrue(retryStarted.await(5, TimeUnit.SECONDS));
+            workers.submit(() -> {
+                assertEquals("PROCESSING", service.recover(userId, request.clientRequestId()).items().getFirst().status());
+                assertEquals("REQUEST_IN_PROGRESS",
+                        assertThrows(ApiException.class, () -> service.create(userId, request)).code());
+                assertEquals("CHAT_IN_PROGRESS",
+                        assertThrows(ApiException.class, () -> service.create(userId, otherRequest)).code());
+                assertEquals("SUCCEEDED", service.create(otherUser, otherRequest).status());
+                service.forgetUser(userId);
+            }).get(5, TimeUnit.SECONDS);
+            releaseRetry.countDown();
+            var deleted = assertThrows(ExecutionException.class, () -> pending.get(5, TimeUnit.SECONDS));
+            assertEquals("AUTH_REQUIRED", ((ApiException) deleted.getCause()).code());
+            assertTrue(service.recover(userId, request.clientRequestId()).items().isEmpty());
+        } finally {
+            releaseRetry.countDown();
+            workers.shutdownNow();
+        }
+    }
+
+    @Test
+    void mysqlLockWaitTimeoutStopsCompletionRetries() {
+        stubOwner();
+        when(available.getIfAvailable()).thenReturn((content, priorUser, priorAssistant, keys) ->
+                new ChatProvider.Reply(List.of(new ChatProvider.Utterance("JOY", "같이 시작해요."))));
+        ChatMemoryService memory = mock(ChatMemoryService.class);
+        var timeout = new SQLException("lock wait elapsed", "HY000", 1205);
+        var request = new ChatDto.Request(UUID.randomUUID(), "공부를 시작할래요", null, null, List.of("JOY"));
+        when(memory.save(eq(userId), eq(request), any(ChatDto.Exchange.class), any(String.class)))
+                .thenThrow(new CannotAcquireLockException("lock wait elapsed", timeout));
+        ChatService service = new ChatService(jdbc, Clock.systemUTC(), available, null, memory, null, 30);
+
+        assertEquals("CHAT_MEMORY_WRITE_FAILED", service.create(userId, request).failureCode());
+        verify(memory).save(eq(userId), eq(request), any(ChatDto.Exchange.class), any(String.class));
     }
 
     @Test
