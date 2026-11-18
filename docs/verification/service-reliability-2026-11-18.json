@@ -1,0 +1,70 @@
+{
+  "baseCommit": "bd5bef4e539a7cff16a9042e60c0abab5e1d7663",
+  "sourceState": "local integration changes on top of baseCommit",
+  "jarSha256": "bf8362d1604cca73f6eaca128a342fb56bcad9b7d904bae119189a8a18c65000",
+  "externalAiCalled": false,
+  "awsDeploymentTested": false,
+  "localVerification": {
+    "startedAt": "2026-11-18T10:46:13.536Z",
+    "completedAt": "2026-11-18T10:48:15.001Z",
+    "passed": true,
+    "tests": {
+      "suites": 30,
+      "tests": 165,
+      "failures": 0,
+      "errors": 0,
+      "skipped": 0
+    },
+    "smoke": {
+      "passed": true,
+      "operations": 33,
+      "checks": 24
+    },
+    "stagingSmoke": {
+      "passed": true,
+      "profile": "staging",
+      "checks": [
+        "staging profile starts with Flyway on a fresh private MySQL schema",
+        "database-backed health and disabled demo",
+        "guest auth, tasks, study pause/end, and next-start reminder",
+        "guest-to-email registration and data persistence after application restart",
+        "login, reminder cancellation, and account deletion"
+      ],
+      "requestCount": 18,
+      "testedAt": "2026-11-18T10:48:13.668Z",
+      "flywayVerified": true,
+      "expectedMigrations": 5,
+      "appliedMigrations": 5
+    },
+    "schemaParity": {
+      "tables": 15,
+      "columns": 128,
+      "indexes": 95,
+      "foreignKeys": 14,
+      "checks": 36
+    },
+    "mysqlStopped": true
+  },
+  "realMySqlReminderHttp": {
+    "startedAt": "2026-11-18T10:46:56.886Z",
+    "finishedAt": "2026-11-18T10:47:13.569Z",
+    "passed": true,
+    "counts": {
+      "guests": 16,
+      "endedStudies": 16,
+      "concurrentPairs": 8,
+      "created201": 16,
+      "replay200SameId": 16,
+      "crossOwnerDelete404": 16,
+      "ownCurrentMatches": 16
+    },
+    "lockTimeout": {
+      "retryable503": true,
+      "created201": true,
+      "replay200SameId": true,
+      "persistedExactlyOne": true
+    },
+    "appStopped": true,
+    "mysqlStopped": true
+  }
+}

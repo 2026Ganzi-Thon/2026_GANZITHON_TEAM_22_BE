@@ -21,7 +21,11 @@ curl -fsS http://localhost:8080/health
 
 ## 검증
 
+알림 예약과 AI 답변 저장·정산을 합친 버전의 시험 범위, 실행 결과, 팀 리뷰 항목은 [서비스 통합 검증 기록](docs/service-integration-qa.md)에 정리했습니다.
+
 Windows에서 Node.js와 MySQL 8을 설치한 뒤 `node scripts/verify-local.mjs`를 실행합니다. MySQL을 다른 경로에 설치했다면 `GANZI_MYSQL_HOME`에 설치 디렉터리를 지정합니다. 이미 내려받은 Gradle 의존성만 쓰려면 `GANZI_GRADLE_OFFLINE=true`를 설정합니다. 이 스크립트는 별도 로컬 MySQL을 임시 포트에서 시작하고, 자동 시험과 HTTP 점검을 마친 뒤 종료합니다. 로그와 결과는 `build/verification-local/`에 저장합니다.
+
+같은 명령이 빈 DB에 Flyway를 적용하고 `staging` 프로필로 JAR를 실행합니다. 시험용 DB 자격증명은 실행기가 생성합니다. 서버를 재시작한 뒤 게스트에서 이메일 계정으로 전환한 사용자의 할 일·공부·알림 기록을 확인합니다. 실행별 `result.json`에서 `tests`, `smoke`, `stagingSmoke`, `schemaParity`, `mysqlStopped`를 확인할 수 있습니다.
 
 11월 9일 기준 로컬 검증에서 자동 테스트 109개와 HTTP 점검 24개가 통과했습니다. Railway 테스트 환경에서도 DB 상태, 게스트·이메일 로그인, 할 일, 공부 세션, 알림 예약·취소 흐름을 HTTPS로 검증했습니다. 실제 AI 대화 생성과 휴대전화 푸시 수신은 별도의 연동 환경에서 확인합니다.
 
