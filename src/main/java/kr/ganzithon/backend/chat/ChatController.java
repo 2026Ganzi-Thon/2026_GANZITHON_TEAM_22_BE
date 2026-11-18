@@ -26,12 +26,13 @@ public class ChatController {
     public ChatController(ChatService service) { this.service = service; }
 
     @PostMapping
-    public ChatDto.Exchange create(@RequestAttribute("userId") UUID userId, @RequestBody JsonNode body) {
+    public ChatDto.Exchange create(@RequestAttribute("userId") UUID userId,
+                                   @RequestAttribute("requestId") String requestId, @RequestBody JsonNode body) {
         if (body == null || !body.isObject()) throw invalid("JSON object required");
         body.fieldNames().forEachRemaining(field -> {
             if (!FIELDS.contains(field)) throw invalid("Unknown field: " + field);
         });
-        UUID requestId = uuid(body.get("clientRequestId"), "clientRequestId", false);
+        UUID clientRequestId = uuid(body.get("clientRequestId"), "clientRequestId", false);
         UUID sessionId = uuid(body.get("studySessionId"), "studySessionId", true);
         UUID previousId = uuid(body.get("previousRequestId"), "previousRequestId", true);
         JsonNode contentNode = body.get("content");
@@ -57,7 +58,8 @@ public class ChatController {
             }
             characterKeys = List.copyOf(parsed);
         }
-        return service.create(userId, new ChatDto.Request(requestId, content, sessionId, previousId, characterKeys));
+        return service.create(userId, new ChatDto.Request(clientRequestId, content, sessionId, previousId, characterKeys),
+                requestId);
     }
 
     @GetMapping
