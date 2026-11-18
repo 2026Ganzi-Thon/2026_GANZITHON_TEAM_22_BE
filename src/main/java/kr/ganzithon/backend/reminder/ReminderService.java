@@ -51,7 +51,7 @@ public class ReminderService {
         OffsetDateTime normalized = remindAt.withOffsetSameInstant(ZoneOffset.UTC).truncatedTo(ChronoUnit.MICROS);
         lockUser(userId);
         OffsetDateTime now = now();
-        expire(userId, now);
+        ReminderDto.StartReminder active = currentActive(userId, now);
         List<ReminderDto.StartReminder> old = jdbc.query(REMINDER_COLUMNS
                 + "WHERE user_id = ? AND source_session_id = ?", REMINDER_MAPPER, userId, sourceSessionId);
         if (!old.isEmpty()) {
@@ -85,9 +85,7 @@ public class ReminderService {
         if (!"ENDED".equals(sources.get(0).status())) {
             throw new ApiException(409, "STUDY_NOT_ENDED", "End the study session first");
         }
-        List<UUID> active = jdbc.queryForList("SELECT id FROM start_reminders WHERE user_id = ? AND status = 'ACTIVE'",
-                UUID.class, userId);
-        if (!active.isEmpty()) {
+        if (active != null) {
             throw new ApiException(409, "ACTIVE_REMINDER_EXISTS", "Cancel the current reminder first");
         }
         UUID reminderId = UUID.randomUUID();
@@ -99,12 +97,9 @@ public class ReminderService {
 
     @Transactional
     public ReminderDto.Current current(UUID userId) {
-        OffsetDateTime now = now();
         lockUser(userId);
-        expire(userId, now);
-        List<ReminderDto.StartReminder> rows = jdbc.query(REMINDER_COLUMNS
-                + "WHERE user_id = ? AND status = 'ACTIVE'", REMINDER_MAPPER, userId);
-        return new ReminderDto.Current(rows.isEmpty() ? null : rows.get(0), now);
+        OffsetDateTime now = now();
+        return new ReminderDto.Current(currentActive(userId, now), now);
     }
 
     @Transactional
@@ -122,7 +117,7 @@ public class ReminderService {
                 .truncatedTo(ChronoUnit.MICROS);
         lockUser(userId);
         OffsetDateTime now = now();
-        expire(userId, now);
+        currentActive(userId, now);
         ReminderDto.StartReminder saved = find(userId, reminderId);
         if (!"ACTIVE".equals(saved.status())) {
             throw new ApiException(409, "REMINDER_NOT_ACTIVE", "Only an active reminder can be changed");
@@ -151,18 +146,22 @@ public class ReminderService {
     public void cancel(UUID userId, UUID reminderId) {
         lockUser(userId);
         OffsetDateTime now = now();
-        expire(userId, now);
-        find(userId, reminderId);
-        jdbc.update("UPDATE start_reminders SET status = 'CANCELED', canceled_reason = 'USER_CANCELED', "
-                + "updated_at = ? WHERE user_id = ? AND id = ? AND status = 'ACTIVE'", now, userId, reminderId);
+        currentActive(userId, now);
+        ReminderDto.StartReminder saved = find(userId, reminderId);
+        if ("ACTIVE".equals(saved.status())) {
+            jdbc.update("UPDATE start_reminders SET status = 'CANCELED', canceled_reason = 'USER_CANCELED', "
+                    + "updated_at = ? WHERE id = ? AND user_id = ?", now, reminderId, userId);
+        }
     }
 
     /** Called after a genuinely new study session is inserted, within the same transaction and user lock. */
     @Transactional(propagation = Propagation.MANDATORY)
     public void cancelOnStudyStart(UUID userId, OffsetDateTime now) {
-        expire(userId, now);
-        jdbc.update("UPDATE start_reminders SET status = 'CANCELED', canceled_reason = 'NEW_STUDY', "
-                + "updated_at = ? WHERE user_id = ? AND status = 'ACTIVE'", now, userId);
+        ReminderDto.StartReminder active = currentActive(userId, now);
+        if (active != null) {
+            jdbc.update("UPDATE start_reminders SET status = 'CANCELED', canceled_reason = 'NEW_STUDY', "
+                    + "updated_at = ? WHERE id = ? AND user_id = ?", now, active.id(), userId);
+        }
     }
 
     @Transactional(readOnly = true)
@@ -198,13 +197,25 @@ public class ReminderService {
     private void lockUser(UUID userId) {
         List<UUID> rows = jdbc.queryForList("SELECT id FROM users WHERE id = ? FOR UPDATE", UUID.class, userId);
         if (rows.isEmpty()) {
-            throw new ApiException(404, "RESOURCE_NOT_FOUND", "User not found");
+            throw new ApiException(401, "AUTH_REQUIRED", "인증 정보가 올바르지 않습니다.");
         }
     }
 
-    private void expire(UUID userId, OffsetDateTime now) {
+    // Callers already hold the owner row lock. Avoid a range UPDATE on an empty
+    // index interval, which can block another owner's first reminder insert.
+    private ReminderDto.StartReminder currentActive(UUID userId, OffsetDateTime now) {
+        List<ReminderDto.StartReminder> rows = jdbc.query(REMINDER_COLUMNS
+                + "WHERE active_user_id = ?", REMINDER_MAPPER, userId);
+        if (rows.isEmpty()) {
+            return null;
+        }
+        ReminderDto.StartReminder active = rows.getFirst();
+        if (active.remindAt().isAfter(now)) {
+            return active;
+        }
         jdbc.update("UPDATE start_reminders SET status = 'EXPIRED', updated_at = ? "
-                + "WHERE user_id = ? AND status = 'ACTIVE' AND remind_at <= ?", now, userId, now);
+                + "WHERE id = ? AND user_id = ?", now, active.id(), userId);
+        return null;
     }
 
     private OffsetDateTime now() { return OffsetDateTime.now(clock).withOffsetSameInstant(ZoneOffset.UTC); }
