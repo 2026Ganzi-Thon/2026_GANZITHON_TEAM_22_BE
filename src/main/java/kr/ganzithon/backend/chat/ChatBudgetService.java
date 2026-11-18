@@ -55,7 +55,8 @@ public class ChatBudgetService {
     public record UsageView(String timeZone, PeriodUsage daily, PeriodUsage monthly,
                             int dailyRequestLimit, String availability) { }
     private record Event(UUID id, LocalDate day, LocalDate month, long reserved,
-                         long inputRate, long outputRate, String status) { }
+                         long inputRate, long cachedRate, long cacheWriteRate,
+                         long outputRate, String status) { }
     private record AdmittedRequest(String hash, String status, Instant createdAt) { }
 
     @Transactional
@@ -83,12 +84,16 @@ public class ChatBudgetService {
             case "gpt-6-luna" -> 250; // Standard input, including a conservative 2.5x cache-write allowance.
             case "gpt-6.1-terra" -> 2500;
             case "gpt-6.1-sol" -> 5000;
+            case "gpt-6.2-sol" -> 2500; // Reserve every input token at the 30-minute cache-write rate.
             default -> throw failure("AI_MODEL_PRICE_NOT_CONFIGURED");
         };
+        long ordinaryRate = "gpt-6.2-sol".equals(quote.model()) ? 2000 : inputRate;
+        long cachedRate = "gpt-6.2-sol".equals(quote.model()) ? 100 : inputRate;
         long outputRate = switch (quote.model()) {
             case "gpt-6-luna" -> 500;
             case "gpt-6.1-terra" -> 5000;
             case "gpt-6.1-sol" -> 10000;
+            case "gpt-6.2-sol" -> 10000;
             default -> throw failure("AI_MODEL_PRICE_NOT_CONFIGURED");
         };
         if (quote.maxInputTokens() < 1 || quote.maxInputTokens() > 200000
@@ -109,10 +114,12 @@ public class ChatBudgetService {
         if (requests >= userDailyLimit) throw failure("AI_DAILY_USAGE_EXCEEDED");
         UUID id = UUID.randomUUID();
         jdbc.update("INSERT INTO chat_usage_events (id,scope,user_id,client_request_id,request_hash,model,"
-                + "day_start,month_start,reserved_nano_usd,input_nano_rate,output_nano_rate,max_input_tokens,"
-                + "max_output_tokens,status,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,'RESERVED',?)",
+                + "day_start,month_start,reserved_nano_usd,input_nano_rate,cached_nano_rate,"
+                + "cache_write_nano_rate,output_nano_rate,max_input_tokens,max_output_tokens,status,created_at) "
+                + "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'RESERVED',?)",
                 id, scope, userId, requestId, requestHash, quote.model(), day, month, reserved,
-                inputRate, outputRate, quote.maxInputTokens(), quote.maxOutputTokens(), clock.instant());
+                ordinaryRate, cachedRate, inputRate, outputRate,
+                quote.maxInputTokens(), quote.maxOutputTokens(), clock.instant());
         adjust("MONTH", month, 0, reserved);
         adjust("DAY", day, 0, reserved);
         return new Reservation(id);
@@ -124,10 +131,14 @@ public class ChatBudgetService {
                        String failureCode) {
         lockBillingState();
         List<Event> events = jdbc.query("SELECT id,day_start,month_start,reserved_nano_usd,input_nano_rate,"
-                + "output_nano_rate,status FROM chat_usage_events WHERE scope=? AND id=? FOR UPDATE",
+                + "COALESCE(cached_nano_rate,input_nano_rate) AS cached_nano_rate,"
+                + "COALESCE(cache_write_nano_rate,input_nano_rate) AS cache_write_nano_rate,"
+                + "output_nano_rate,status "
+                + "FROM chat_usage_events WHERE scope=? AND id=? FOR UPDATE",
                 (rs, row) -> new Event(PortableJdbc.uuid(rs, "id"), rs.getObject("day_start", LocalDate.class),
                     rs.getObject("month_start", LocalDate.class), rs.getLong("reserved_nano_usd"),
-                    rs.getLong("input_nano_rate"), rs.getLong("output_nano_rate"), rs.getString("status")),
+                    rs.getLong("input_nano_rate"), rs.getLong("cached_nano_rate"),
+                    rs.getLong("cache_write_nano_rate"), rs.getLong("output_nano_rate"), rs.getString("status")),
                 scope, reservation.id());
         if (events.isEmpty()) throw new IllegalStateException("Missing AI spending reservation");
         Event event = events.getFirst();
@@ -143,10 +154,15 @@ public class ChatBudgetService {
         if (jdbc.queryForList("SELECT id " + selection + " LIMIT 1", UUID.class, scope, cutoff).isEmpty()) return;
         lockBillingState();
         List<Event> abandoned = jdbc.query("SELECT id,day_start,month_start,reserved_nano_usd,input_nano_rate,"
-                        + "output_nano_rate,status " + selection + " ORDER BY created_at,id LIMIT 100 FOR UPDATE",
+                        + "COALESCE(cached_nano_rate,input_nano_rate) AS cached_nano_rate,"
+                        + "COALESCE(cache_write_nano_rate,input_nano_rate) AS cache_write_nano_rate,"
+                        + "output_nano_rate,status " + selection
+                        + " ORDER BY created_at,id LIMIT 100 FOR UPDATE",
                 (rs, row) -> new Event(PortableJdbc.uuid(rs, "id"), rs.getObject("day_start", LocalDate.class),
                     rs.getObject("month_start", LocalDate.class), rs.getLong("reserved_nano_usd"),
-                    rs.getLong("input_nano_rate"), rs.getLong("output_nano_rate"), rs.getString("status")), scope, cutoff);
+                    rs.getLong("input_nano_rate"), rs.getLong("cached_nano_rate"),
+                    rs.getLong("cache_write_nano_rate"), rs.getLong("output_nano_rate"),
+                    rs.getString("status")), scope, cutoff);
         for (Event event : abandoned) settleEvent(event, null, true, "CHAT_RESULT_UNAVAILABLE");
     }
 
@@ -154,13 +170,20 @@ public class ChatBudgetService {
 
     private void settleEvent(Event event, ChatProvider.Usage usage, boolean chargeableUnknown, String failureCode) {
         boolean validUsage = usage != null && usage.inputTokens() >= 0 && usage.outputTokens() >= 0
-                && usage.cachedInputTokens() >= 0 && usage.cachedInputTokens() <= usage.inputTokens();
+                && usage.cachedInputTokens() >= 0 && usage.cacheWriteInputTokens() >= 0
+                && usage.cachedInputTokens() <= usage.inputTokens()
+                && usage.cacheWriteInputTokens() <= usage.inputTokens() - usage.cachedInputTokens();
         if (usage != null && !validUsage) chargeableUnknown = true;
         long charge = chargeableUnknown ? event.reserved() : 0;
         if (validUsage) {
             try {
-                charge = Math.addExact(Math.multiplyExact(usage.inputTokens(), event.inputRate()),
-                        Math.multiplyExact(usage.outputTokens(), event.outputRate()));
+                long ordinaryTokens = usage.inputTokens() - usage.cachedInputTokens()
+                        - usage.cacheWriteInputTokens();
+                charge = Math.addExact(Math.addExact(
+                        Math.multiplyExact(ordinaryTokens, event.inputRate()),
+                        Math.multiplyExact(usage.cachedInputTokens(), event.cachedRate())),
+                        Math.addExact(Math.multiplyExact(usage.cacheWriteInputTokens(), event.cacheWriteRate()),
+                                Math.multiplyExact(usage.outputTokens(), event.outputRate())));
             } catch (ArithmeticException ex) {
                 // Malformed usage must never release an existing reservation.
                 validUsage = false;
@@ -170,8 +193,10 @@ public class ChatBudgetService {
         }
         String status = validUsage ? "SETTLED" : chargeableUnknown ? "UNKNOWN" : "REJECTED";
         jdbc.update("UPDATE chat_usage_events SET charged_nano_usd=?,input_tokens=?,cached_input_tokens=?,"
-                + "output_tokens=?,status=?,failure_code=?,finished_at=? WHERE scope=? AND id=?",
+                + "cache_write_input_tokens=?,output_tokens=?,status=?,failure_code=?,finished_at=? "
+                + "WHERE scope=? AND id=?",
                 charge, validUsage ? usage.inputTokens() : null, validUsage ? usage.cachedInputTokens() : null,
+                validUsage ? usage.cacheWriteInputTokens() : null,
                 validUsage ? usage.outputTokens() : null, status, failureCode, clock.instant(), scope, event.id());
         adjust("MONTH", event.month(), charge, -event.reserved());
         adjust("DAY", event.day(), charge, -event.reserved());

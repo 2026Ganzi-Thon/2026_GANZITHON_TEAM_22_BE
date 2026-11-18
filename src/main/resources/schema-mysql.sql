@@ -173,6 +173,9 @@ CREATE TABLE IF NOT EXISTS chat_usage_events (
  failure_code VARCHAR(64) CHARACTER SET ascii COLLATE ascii_bin NULL,
  created_at DATETIME(6) NOT NULL,
  finished_at DATETIME(6) NULL,
+ cached_nano_rate BIGINT NULL,
+ cache_write_nano_rate BIGINT NULL,
+ cache_write_input_tokens BIGINT NULL,
  PRIMARY KEY (id),
  UNIQUE KEY uq_chat_usage_scope_user_request (scope,user_id,client_request_id),
  KEY idx_chat_usage_scope_user_day (scope,user_id,day_start),
@@ -181,13 +184,16 @@ CREATE TABLE IF NOT EXISTS chat_usage_events (
  CONSTRAINT chk_chat_usage_reserved CHECK (reserved_nano_usd >= 0),
  CONSTRAINT chk_chat_usage_charged CHECK (charged_nano_usd IS NULL OR charged_nano_usd >= 0),
  CONSTRAINT chk_chat_usage_input_rate CHECK (input_nano_rate >= 0),
+ CONSTRAINT chk_chat_usage_cached_rate CHECK (cached_nano_rate IS NULL OR cached_nano_rate >= 0),
+ CONSTRAINT chk_chat_usage_cache_write_rate CHECK (cache_write_nano_rate IS NULL OR cache_write_nano_rate >= 0),
  CONSTRAINT chk_chat_usage_output_rate CHECK (output_nano_rate >= 0),
  CONSTRAINT chk_chat_usage_max_input CHECK (max_input_tokens >= 0),
  CONSTRAINT chk_chat_usage_max_output CHECK (max_output_tokens >= 0),
  CONSTRAINT chk_chat_usage_input_tokens CHECK (input_tokens IS NULL OR input_tokens >= 0),
  CONSTRAINT chk_chat_usage_cached_tokens CHECK (cached_input_tokens IS NULL OR cached_input_tokens >= 0),
+ CONSTRAINT chk_chat_usage_cache_write_tokens CHECK (cache_write_input_tokens IS NULL OR cache_write_input_tokens >= 0),
  CONSTRAINT chk_chat_usage_output_tokens CHECK (output_tokens IS NULL OR output_tokens >= 0),
- CONSTRAINT chk_chat_usage_status CHECK (status IN ('RESERVED','SETTLED','UNKNOWN','REJECTED'))
+ CONSTRAINT chk_chat_usage_status CHECK (status IN (_ascii'RESERVED',_ascii'SETTLED',_ascii'UNKNOWN',_ascii'REJECTED'))
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
 
 CREATE TABLE IF NOT EXISTS chat_billing_state (

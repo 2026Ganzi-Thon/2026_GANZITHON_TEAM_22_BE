@@ -73,6 +73,42 @@ class ChatBudgetIntegrationTest {
     }
 
     @Test
+    void impossibleCombinedCacheCountsKeepSol62ReservationCharged() {
+        String scope = scope();
+        UUID user = user();
+        ChatBudgetService budget = budget(scope, "1", "10", 100, 1);
+        ChatProvider.CostQuote quote = new ChatProvider.CostQuote("gpt-6.2-sol", 100, 10);
+        ChatBudgetService.Reservation reservation = tx(() -> budget.reserve(
+                user, UUID.randomUUID(), "y".repeat(64), quote));
+        tx(() -> { budget.settle(reservation, new ChatProvider.Usage(100, 80, 3, 30), false, null);
+            return null; });
+        assertEquals("UNKNOWN", jdbc.queryForObject("SELECT status FROM chat_usage_events WHERE id=?",
+                String.class, reservation.id().toString()));
+        assertEquals(new BigDecimal("0.000350000"), budget.usage(user).daily().estimatedUsd());
+    }
+
+
+    @Test
+    void sol62ReservesCacheWriteMaximumAndSettlesEachInputClassAtItsPrice() {
+        String scope = scope();
+        UUID user = user();
+        ChatBudgetService budget = budget(scope, "1", "10", 100, 1);
+        ChatProvider.CostQuote quote = new ChatProvider.CostQuote("gpt-6.2-sol", 100, 10);
+        ChatBudgetService.Reservation reservation = tx(() -> budget.reserve(
+                user, UUID.randomUUID(), "z".repeat(64), quote));
+        assertEquals(new BigDecimal("0.000350000"), budget.usage(user).daily().reservedUsd());
+
+        tx(() -> { budget.settle(reservation, new ChatProvider.Usage(100, 30, 3, 30), false, null);
+            return null; });
+        assertEquals(new BigDecimal("0.000188000"), budget.usage(user).daily().estimatedUsd());
+        assertEquals(new BigDecimal("0.000000000"), budget.usage(user).daily().reservedUsd());
+        assertEquals(Long.valueOf(30), jdbc.queryForObject(
+                "SELECT cache_write_input_tokens FROM chat_usage_events WHERE id=?", Long.class,
+                reservation.id().toString()));
+    }
+
+
+    @Test
     void configuredBeanPersistsActualUsageAndRejectsDuplicateAdmissionAcrossInstances() {
         scopes.add(CONFIG_SCOPE);
         UUID user = user();

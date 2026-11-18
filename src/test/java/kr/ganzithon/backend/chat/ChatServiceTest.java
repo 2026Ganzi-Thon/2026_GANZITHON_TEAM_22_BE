@@ -21,6 +21,8 @@ import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.doReturn;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 class ChatServiceTest {
@@ -59,6 +61,85 @@ class ChatServiceTest {
         ApiException stale = assertThrows(ApiException.class, () -> service.create(userId,
                 new ChatDto.Request(UUID.randomUUID(), "다음", null, firstId, List.of("JOY"))));
         assertEquals("INVALID_PREVIOUS_EXCHANGE", stale.code());
+    }
+
+    @Test
+    void successfulTurnsReachTheProviderWithoutClientPreviousIdAndReplayDoesNotDuplicateThem() {
+        stubOwner();
+        List<ChatProvider.Turn> received = new java.util.ArrayList<>();
+        ChatProvider model = new ChatProvider() {
+            @Override public boolean usesSessionTranscript() { return true; }
+            @Override public Reply generate(String content, String previousUser, String previousAssistant,
+                                            List<String> keys) {
+                throw new AssertionError("Turn overload must be used");
+            }
+            @Override public Reply generate(Turn turn) {
+                received.add(turn);
+                return new Reply(List.of(new Utterance("JOY", "답변 " + received.size())));
+            }
+        };
+        when(available.getIfAvailable()).thenReturn(model);
+        ChatService service = new ChatService(jdbc, Clock.systemUTC(), available, 30);
+        ChatDto.Request first = new ChatDto.Request(UUID.randomUUID(), "첫 원문", null, null, List.of("JOY"));
+        ChatDto.Request second = new ChatDto.Request(UUID.randomUUID(), "둘째 원문", null, null, List.of("JOY"));
+        service.create(userId, first);
+        service.create(userId, first);
+        service.create(userId, second);
+        assertEquals(2, received.size());
+        assertEquals(1, received.get(0).currentTurn());
+        assertTrue(received.get(0).sessionTranscript().isEmpty());
+        assertEquals(2, received.get(1).currentTurn());
+        assertEquals(List.of(new ChatProvider.TranscriptTurn(1, "첫 원문",
+                List.of(new ChatProvider.Utterance("JOY", "답변 1")))),
+                received.get(1).sessionTranscript());
+    }
+
+    @Test
+    void quoteAndGenerateReceiveTheSameSelectedTurn() {
+        stubOwner();
+        AtomicReference<ChatProvider.Turn> quoted = new AtomicReference<>();
+        when(available.getIfAvailable()).thenReturn(new ChatProvider() {
+            @Override public Reply generate(String content, String previousUser, String previousAssistant,
+                                            List<String> keys) {
+                throw new AssertionError("Turn overload must be used");
+            }
+            @Override public CostQuote quote(Turn turn) {
+                quoted.set(turn);
+                return null;
+            }
+            @Override public Reply generate(Turn turn) {
+                assertTrue(quoted.get() == turn);
+                return new Reply(List.of(new Utterance("JOY", "좋아요.")));
+            }
+        });
+        ChatService service = new ChatService(jdbc, Clock.systemUTC(), available, 30);
+        assertEquals("SUCCEEDED", service.create(userId, new ChatDto.Request(UUID.randomUUID(),
+                "안녕", null, null, List.of("JOY"))).status());
+    }
+
+    @Test
+    void legacyProviderRetainsLongTermContextWithoutTranscriptExclusion() {
+        stubOwner();
+        ChatMemoryService memory = mock(ChatMemoryService.class);
+        when(memory.context(userId, "안녕", null)).thenReturn("legacy-context");
+        when(memory.save(eq(userId), any(ChatDto.Request.class), any(ChatDto.Exchange.class), any(String.class)))
+                .thenAnswer(inv -> new ChatMemoryService.Saved(inv.getArgument(1), inv.getArgument(2), inv.getArgument(3)));
+        AtomicReference<ChatProvider.Turn> received = new AtomicReference<>();
+        when(available.getIfAvailable()).thenReturn(new ChatProvider() {
+            @Override public Reply generate(String content, String previousUser, String previousAssistant,
+                                            List<String> keys) { throw new AssertionError(); }
+            @Override public Reply generate(Turn turn) {
+                received.set(turn);
+                return new Reply(List.of(new Utterance("JOY", "반가워요.")));
+            }
+        });
+        ChatService service = new ChatService(jdbc, Clock.systemUTC(), available,
+                null, memory, null, 30);
+        assertEquals("SUCCEEDED", service.create(userId, new ChatDto.Request(UUID.randomUUID(),
+                "안녕", null, null, List.of("JOY"))).status());
+        assertEquals("legacy-context", received.get().memoryContext());
+        assertTrue(received.get().sessionTranscript().isEmpty());
+        verify(memory, never()).transcript(userId, null);
     }
 
     @Test

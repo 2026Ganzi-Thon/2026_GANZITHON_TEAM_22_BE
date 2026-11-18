@@ -201,6 +201,43 @@ class ChatMemoryIntegrationTest {
         assertFalse(inflectedContext.contains("850점이"));
     }
 
+    @Test
+    void transcriptIsOrderedBoundedAndScopedToOwnerAndRoomIncludingArchivedRows() {
+        UUID owner = user();
+        UUID other = user();
+        UUID room = UUID.randomUUID();
+        UUID elsewhere = UUID.randomUUID();
+        Instant base = Instant.now().minus(70, ChronoUnit.DAYS);
+        ChatDto.Request otherOwner = request("다른 계정 비밀", room);
+        memory.save(other, otherOwner, exchange(otherOwner, base, "SUCCEEDED"), "a".repeat(64));
+        ChatDto.Request otherRoom = request("다른 방 비밀", elsewhere);
+        memory.save(owner, otherRoom, exchange(otherRoom, base.plusSeconds(1), "SUCCEEDED"), "b".repeat(64));
+        ChatDto.Request failed = request("실패한 말", room);
+        memory.save(owner, failed, exchange(failed, base.plusSeconds(2), "FAILED"), "c".repeat(64));
+        for (int i = 0; i < 10; i++) {
+            ChatDto.Request turn = request("원문 " + i, room);
+            ChatDto.Exchange reply = new ChatDto.Exchange(UUID.randomUUID(), turn.clientRequestId(), room,
+                    "SUCCEEDED", List.of(new ChatDto.Utterance("JOY", "답변 원문 " + i)), null,
+                    base.plusSeconds(i + 2), base.plusSeconds(i + 3));
+            memory.save(owner, turn, reply, Integer.toHexString(i).repeat(64).substring(0, 64));
+        }
+        assertEquals(13, memory.archiveOld(100));
+
+        ChatMemoryService.Transcript transcript = memory.transcript(owner, room);
+        assertEquals(9, transcript.currentTurn());
+        assertEquals(8, transcript.turns().size());
+        assertEquals(1, transcript.turns().getFirst().turn());
+        assertEquals("원문 2", transcript.turns().getFirst().user());
+        assertEquals("답변 원문 9", transcript.turns().getLast().replies().getFirst().content());
+        assertEquals(8, transcript.exchangeIds().size());
+        String recall = memory.context(owner, "원문 9", null, transcript.exchangeIds());
+        assertFalse(recall.contains("원문 9"));
+        assertTrue(recall.contains("원문 0"));
+        assertFalse(transcript.toString().contains("다른 계정 비밀"));
+        assertFalse(transcript.toString().contains("다른 방 비밀"));
+        assertFalse(transcript.toString().contains("실패한 말"));
+    }
+
     private UUID user() {
         UUID id = UUID.randomUUID();
         jdbc.update("INSERT INTO users(id,created_at) VALUES(?,?)", id.toString(), LocalDateTime.ofInstant(Instant.now(), ZoneOffset.UTC));

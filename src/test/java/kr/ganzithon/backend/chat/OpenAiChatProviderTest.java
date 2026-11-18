@@ -10,6 +10,7 @@ import java.net.URI;
 import java.net.http.HttpClient;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -25,6 +26,118 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 class OpenAiChatProviderTest {
     private final ObjectMapper mapper = new ObjectMapper();
     private final List<String> keys = List.of("JOY", "ANGRY", "SAD");
+
+    @Test
+    void cacheWritesAreSeparatedFromReadsAndInvalidTotalsAreRejected() throws Exception {
+        HttpServer server = server();
+        AtomicInteger calls = new AtomicInteger();
+        server.createContext("/v1/responses", exchange -> {
+            int call = calls.incrementAndGet();
+            String details = call == 1
+                ? "{\"cached_tokens\":30,\"cache_write_tokens\":50}"
+                : "{\"cached_tokens\":80,\"cache_write_tokens\":50}";
+            respond(exchange, 200, "{\"status\":\"completed\",\"output\":[{\"type\":\"message\",\"content\":[{\"type\":\"output_text\",\"text\":\"{\\\"utterances\\\":[{\\\"characterKey\\\":\\\"JOY\\\",\\\"content\\\":\\\"안녕\\\"}]}\"}]}],\"usage\":{\"input_tokens\":100,\"input_tokens_details\":"
+                + details + ",\"output_tokens\":8}}");
+        });
+        server.start();
+        try {
+            OpenAiChatProvider provider = provider(server, 2, "gpt-6.2-sol", 2048);
+            assertEquals(new ChatProvider.Usage(100, 30, 8, 50),
+                provider.generate("안녕", null, null, List.of("JOY")).usage());
+            ChatProviderException invalid = assertThrows(ChatProviderException.class, () ->
+                provider.generate("안녕", null, null, List.of("JOY")));
+            assertEquals("AI_RESPONSE_INVALID", invalid.code());
+            assertTrue(invalid.chargeableUnknown());
+        } finally { server.stop(0); }
+    }
+
+
+    @Test
+    void sol62UsesFixedDeveloperBoundaryAndChronologicalTranscript() throws Exception {
+        HttpServer server = server();
+        AtomicReference<byte[]> sent = new AtomicReference<>();
+        server.createContext("/v1/responses", exchange -> {
+            sent.set(exchange.getRequestBody().readAllBytes());
+            respond(exchange, 200, response("completed", """
+                {"utterances":[{"characterKey":"SAD","content":"그때 이야기 기억나."}]}
+                """));
+        });
+        server.start();
+        try {
+            OpenAiChatProvider provider = provider(server, 2, "gpt-6.2-sol", 2048);
+            var history = List.of(
+                new ChatProvider.TranscriptTurn(1, "과제 끝낼 거야", List.of(
+                    new ChatProvider.Utterance("JOY", "같이 있자."))),
+                new ChatProvider.TranscriptTurn(2, "잠깐 쉴래", List.of(
+                    new ChatProvider.Utterance("SAD", "쉬어도 돼."))));
+            var turn = new ChatProvider.Turn("아까 뭐라고 했지?", null, null,
+                List.of("SAD", "JOY"), "PAUSED", "오래된 기억", false, history, 3);
+            ChatProvider.CostQuote quote = provider.quote(turn);
+            provider.generate(turn);
+            assertEquals(sent.get().length + 4096L, quote.maxInputTokens());
+            JsonNode request = mapper.readTree(sent.get());
+            assertEquals("gpt-6.2-sol", request.path("model").asText());
+            assertFalse(request.has("instructions"));
+            assertFalse(request.path("store").asBoolean());
+            assertEquals("medium", request.path("reasoning").path("effort").asText());
+            assertEquals("standard", request.path("reasoning").path("mode").asText());
+            assertEquals("explicit", request.path("prompt_cache_options").path("mode").asText());
+            assertEquals("30m", request.path("prompt_cache_options").path("ttl").asText());
+            assertEquals("haeboyang-chat-transcript-v1-group-JOY-SAD",
+                request.path("prompt_cache_key").asText());
+            JsonNode developer = request.path("input").get(0);
+            assertEquals("developer", developer.path("role").asText());
+            assertEquals("input_text", developer.path("content").get(0).path("type").asText());
+            assertEquals("explicit", developer.path("content").get(0)
+                .path("prompt_cache_breakpoint").path("mode").asText());
+            String prompt = developer.path("content").get(0).path("text").asText();
+            assertTrue(prompt.startsWith(CharacterPrompt.systemPrompt() + "\n"));
+            assertTrue(prompt.endsWith("이어지는 발언에서는 이미 나온 설명을 반복하지 마라."));
+            assertFalse(prompt.contains("아까 뭐라고 했지?"));
+            JsonNode user = request.path("input").get(1);
+            assertEquals("user", user.path("role").asText());
+            JsonNode context = mapper.readTree(user.path("content").asText());
+            assertEquals(3, context.path("currentTurn").asInt());
+            assertEquals("아까 뭐라고 했지?", context.path("currentUserContent").asText());
+            assertEquals("PAUSED", context.path("serverStudyState").asText());
+            assertEquals("오래된 기억", context.path("memoryContext").asText());
+            assertEquals(2, context.path("sessionTranscript").size());
+            assertEquals("과제 끝낼 거야", context.path("sessionTranscript").get(0).path("user").asText());
+            assertEquals("JOY", context.path("sessionTranscript").get(0).path("replies")
+                .get(0).path("characterKey").asText());
+            assertEquals("잠깐 쉴래", context.path("sessionTranscript").get(1).path("user").asText());
+            assertFalse(context.has("previousUserContent"));
+            assertFalse(context.has("previousAssistantContent"));
+            provider.generate(new ChatProvider.Turn("처음 왔어", null, null,
+                List.of("SAD", "JOY"), "HOME", null, false));
+            JsonNode fresh = mapper.readTree(mapper.readTree(sent.get()).path("input")
+                .get(1).path("content").asText());
+            assertFalse(fresh.has("memoryContext"));
+            assertEquals(0, fresh.path("sessionTranscript").size());
+            assertEquals(1, fresh.path("currentTurn").asInt());
+        } finally { server.stop(0); }
+    }
+
+
+    @Test
+    void transcriptCapabilityAndEightFullKoreanTurnsFitRequest() throws Exception {
+        HttpServer server = server();
+        OpenAiChatProvider sol62 = provider(server, 2, "gpt-6.2-sol", 2048);
+        assertTrue(sol62.usesSessionTranscript());
+        assertFalse(provider(server, 2, "gpt-6.1-sol", 2048).usesSessionTranscript());
+        List<ChatProvider.TranscriptTurn> history = new ArrayList<>();
+        for (int i = 1; i <= 8; i++) {
+            history.add(new ChatProvider.TranscriptTurn(i, "가".repeat(1000), List.of(
+                new ChatProvider.Utterance("JOY", "나".repeat(300)),
+                new ChatProvider.Utterance("ANGRY", "다".repeat(300)),
+                new ChatProvider.Utterance("SAD", "라".repeat(300)),
+                new ChatProvider.Utterance("JOY", "마".repeat(300)))));
+        }
+        var turn = new ChatProvider.Turn("바".repeat(1000), null, null, keys,
+            "HOME", "사".repeat(6000), false, history, 9);
+        assertTrue(sol62.quote(turn).maxInputTokens() > 65_536L);
+    }
+
 
     @Test
     void focusedSolRequestUsesMediumThinkingAndQuotesThePayloadThatIsSent() throws Exception {

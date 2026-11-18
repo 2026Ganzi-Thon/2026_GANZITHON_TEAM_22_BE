@@ -6,6 +6,7 @@ import net from 'node:net';
 import crypto from 'node:crypto';
 import { spawn, spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
+import { schemaSnapshot, compareSchemaSnapshots } from './schema-parity.mjs';
 
 const repo = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const root = path.join(repo, 'build', 'verification-local');
@@ -45,7 +46,7 @@ for (const signal of ['SIGINT', 'SIGTERM']) {
   });
 }
 const result = { passed: false, startedAt: new Date().toISOString(), tests: null,
-  smoke: null, mysqlStopped: false, runDirectory: run };
+  smoke: null, schemaParity: null, mysqlStopped: false, runDirectory: run };
 
 function fail(message) { throw new Error(message); }
 function checkAbort() { if (abortSignal) fail(`사용자가 ${abortSignal} 신호로 검증을 중단했습니다.`); }
@@ -102,11 +103,17 @@ function ownedPort() {
   lastPortProbe = { status: check.status, errorCode: check.error?.code ?? null };
   return check.status === 0 && check.stdout.trim() === String(port);
 }
-function mysqlCommand(sql) {
+function mysqlCommand(sql, timeout = 5000) {
   return spawnSync(mysql, ['--no-defaults', '--protocol=tcp', '--host=127.0.0.1',
-    `--port=${port}`, '--user=root', '--connect-timeout=1', '--batch', '--skip-column-names'],
+    `--port=${port}`, '--user=root', '--connect-timeout=1', '--batch', '--skip-column-names', '--raw'],
   { cwd: work, env: { ...safeEnv(), MYSQL_PWD: rootPassword }, input: sql,
-    encoding: 'utf8', windowsHide: true, timeout: 5000 });
+    encoding: 'utf8', windowsHide: true, timeout, maxBuffer: 20 * 1024 * 1024 });
+}
+function mysqlRows(sql) {
+  const query = mysqlCommand(sql, 60000);
+  if (query.error || query.status !== 0)
+    fail(`스키마 메타데이터 조회 실패: ${query.error?.code ?? query.status ?? '알 수 없음'}`);
+  return query.stdout;
 }
 async function startMysql() {
   fs.mkdirSync(mysqlData, { recursive: true });
@@ -263,6 +270,8 @@ try {
   const smoke = JSON.parse(fs.readFileSync(path.join(work, 'build', 'smoke-result.json'), 'utf8'));
   if (!smoke.passed || smoke.implementedOperations !== 33) fail('HTTP 점검 결과가 예상과 다릅니다.');
   result.smoke = { passed: true, operations: smoke.implementedOperations, checks: smoke.checks.length };
+  result.schemaParity = compareSchemaSnapshots(
+    schemaSnapshot(mysqlRows, databases.migration), schemaSnapshot(mysqlRows, databases.smoke));
   result.passed = true;
   console.log(`HTTP API ${result.smoke.operations}개 점검 완료.`);
 } catch (error) {

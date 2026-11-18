@@ -10,7 +10,9 @@ Java 21 JDK를 설치하고 `JAVA_HOME`을 설정합니다. Gradle은 저장소�
 ./gradlew bootJar --no-daemon
 ```
 
-Windows에서는 `gradlew.bat bootJar --no-daemon`을 실행합니다. 별도 MySQL 데이터베이스를 준비하고 아래 배포 환경변수를 넣은 뒤, `SPRING_PROFILES_ACTIVE=staging`으로 JAR를 실행합니다. 새 데이터베이스에 Flyway가 `V1`부터 `V4`까지 적용합니다.
+Windows에서는 `gradlew.bat bootJar --no-daemon`을 실행합니다. 별도 MySQL 데이터베이스를 준비하고 아래 배포 환경변수를 넣은 뒤, `SPRING_PROFILES_ACTIVE=staging`으로 JAR를 실행합니다. 새 데이터베이스에는 Flyway가 V1부터 V5까지 적용하고, Flyway로 V4까지 관리한 기존 데이터베이스에는 V5만 추가합니다. V5는 6.2 캐시 읽기·쓰기 단가와 사용량을 기록할 열을 추가합니다.
+
+`local` 프로필은 `schema-mysql.sql`로 빈 개발 DB를 초기화합니다. 기존 테이블을 계속 쓰는 개발 DB는 업그레이드 전에 스키마 버전을 확인하세요. V4와 같은 구조이고 V5 열이 아직 없다면 [V5 변경 SQL](src/main/resources/db/migration/V5__chat_cache_usage_rates.sql)을 한 번 적용해야 합니다.
 
 ```sh
 java -jar build/libs/ganzithon-backend-0.6.0-local.jar
@@ -37,7 +39,7 @@ Windows에서 Node.js와 MySQL 8을 설치한 뒤 `node scripts/verify-local.mjs
 | `GANZI_DB_USERNAME`, `GANZI_DB_PASSWORD` | 애플리케이션 전용 DB 계정 |
 | `GANZI_ALLOWED_ORIGINS` | 웹 프론트 Origin을 쉼표로 구분한 목록. 예시 `http://localhost:5173` |
 | `GANZI_CHAT_ENABLED`, `GANZI_PUSH_ENABLED` | 초기 배포에서는 `false`. 각 제공자 설정을 검증한 뒤 활성화 |
-| `GANZI_OPENAI_MODEL`, `GANZI_OPENAI_MAX_OUTPUT_TOKENS` | 기본 `gpt-6.1-sol`(Thinking `medium`), 출력 상한 `2048` 토큰 |
+| `GANZI_OPENAI_MODEL`, `GANZI_OPENAI_MAX_OUTPUT_TOKENS` | 기본 `gpt-6.2-sol`(Thinking `medium`), 출력 상한 `2048` 토큰. 배포 환경에 모델이 지정돼 있으면 그 값이 우선한다. |
 | `GANZI_OPENAI_REASONING_EFFORT` | 미지정 시 Sol은 `medium`, Luna·Terra는 `none`. 동일한 추론 조건으로 비교할 때는 `medium`을 명시 |
 | `GANZI_CHAT_INTENT_ROUTING_ENABLED` | 기본 `true`. `false`로 설정하면 그룹 프롬프트로 대화한다. [캐릭터 대화 연동 가이드](docs/chat-intent-routing.md) |
 
