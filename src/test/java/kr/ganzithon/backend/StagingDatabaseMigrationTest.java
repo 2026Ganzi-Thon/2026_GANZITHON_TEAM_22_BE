@@ -18,7 +18,7 @@ class StagingDatabaseMigrationTest {
     void initialMigrationAndRepeatedStartupPreserveCommittedData() throws Exception {
         String url = guardedUrl("GANZI_MIGRATION_DB_URL", "migration");
         Flyway flyway = flyway(url);
-        assertEquals(4, flyway.migrate().migrationsExecuted);
+        assertEquals(5, flyway.migrate().migrationsExecuted);
         String id = UUID.randomUUID().toString();
         try (Connection connection = connect(url)) {
             try (var insert = connection.prepareStatement("INSERT INTO users(id,created_at) VALUES(?,UTC_TIMESTAMP(6))")) {
@@ -62,7 +62,7 @@ class StagingDatabaseMigrationTest {
                 statement.setString(1, id);
                 statement.executeUpdate();
             }
-        assertEquals(3, flyway(url).migrate().migrationsExecuted);
+        assertEquals(4, flyway(url).migrate().migrationsExecuted);
             try (var statement = connection.prepareStatement("SELECT COUNT(*) FROM users WHERE id=?")) {
                 statement.setString(1, id);
                 try (var rows = statement.executeQuery()) {

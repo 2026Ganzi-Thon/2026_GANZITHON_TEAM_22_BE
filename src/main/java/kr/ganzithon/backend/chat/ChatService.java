@@ -9,6 +9,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Set;
 import java.util.UUID;
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
@@ -30,6 +31,8 @@ import org.springframework.transaction.support.TransactionTemplate;
 public class ChatService {
     private static final Duration RETENTION = Duration.ofMinutes(15);
     private static final int MAX_FRESH_EXCHANGES = 1024;
+    private static final int MAX_TRANSCRIPT_TURNS = 8;
+    private static final int MAX_TRANSCRIPT_UTF8_BYTES = 20_000;
     private static final int MAX_PER_USER_PER_MINUTE = 10;
 
     private record Key(UUID userId, UUID requestId) { }
@@ -109,6 +112,7 @@ public class ChatService {
         String previousUserContent = null;
         String previousAssistantContent = null;
         String memoryContext = null;
+        ChatMemoryService.Transcript transcript;
         String studyState;
         synchronized (this) {
             requireOwner(userId);
@@ -163,7 +167,18 @@ public class ChatService {
             }
             model.ensureConfigured();
             if (memory != null) {
-                memoryContext = memory.context(userId, request.content(), request.previousRequestId());
+                if (model.usesSessionTranscript()) {
+                    transcript = memory.transcript(userId, request.studySessionId());
+                    memoryContext = memory.context(userId, request.content(), request.previousRequestId(),
+                            transcript.exchangeIds());
+                } else {
+                    transcript = new ChatMemoryService.Transcript(List.of(), 1, Set.of());
+                    memoryContext = memory.context(userId, request.content(), request.previousRequestId());
+                }
+            } else {
+                transcript = model.usesSessionTranscript()
+                        ? localTranscript(userId, request.studySessionId())
+                        : new ChatMemoryService.Transcript(List.of(), 1, Set.of());
             }
             long recent = entries.values().stream()
                     .filter(item -> item.userId.equals(userId)
@@ -191,7 +206,7 @@ public class ChatService {
                 ? CharacterIntentRouter.select(request.content(), candidates) : candidates;
             ChatProvider.Turn turn = new ChatProvider.Turn(request.content(), previousUserContent,
                 previousAssistantContent, speakers, studyState, memoryContext,
-                intentRoutingEnabled && speakers.size() == 1);
+                intentRoutingEnabled && speakers.size() == 1, transcript.turns(), transcript.currentTurn());
             ChatProvider.CostQuote quote = model.quote(turn);
             if (quote != null) {
                 if (budget == null) throw new IllegalStateException("Missing AI budget service");
@@ -345,6 +360,35 @@ public class ChatService {
             }
         }
         return latest;
+    }
+
+    private ChatMemoryService.Transcript localTranscript(UUID userId, UUID studySessionId) {
+        List<Entry> completed = entries.values().stream()
+                .filter(item -> item.userId.equals(userId)
+                        && Objects.equals(item.request.studySessionId(), studySessionId)
+                        && "SUCCEEDED".equals(item.status))
+                .sorted(java.util.Comparator.comparingLong((Entry item) -> item.completedOrder).reversed()).toList();
+        List<ChatProvider.TranscriptTurn> reverse = new ArrayList<>();
+        int usedBytes = 0;
+        for (Entry item : completed) {
+            if (reverse.size() >= MAX_TRANSCRIPT_TURNS) break;
+            int bytes = item.request.content().getBytes(StandardCharsets.UTF_8).length;
+            for (ChatDto.Utterance line : item.utterances) {
+                bytes += line.characterKey().getBytes(StandardCharsets.UTF_8).length
+                        + line.content().getBytes(StandardCharsets.UTF_8).length;
+            }
+            if (usedBytes + bytes > MAX_TRANSCRIPT_UTF8_BYTES) break;
+            usedBytes += bytes;
+            reverse.add(new ChatProvider.TranscriptTurn(0, item.request.content(),
+                    item.utterances.stream().map(line -> new ChatProvider.Utterance(
+                            line.characterKey(), line.content())).toList()));
+        }
+        List<ChatProvider.TranscriptTurn> turns = new ArrayList<>();
+        for (int index = reverse.size() - 1; index >= 0; index--) {
+            ChatProvider.TranscriptTurn item = reverse.get(index);
+            turns.add(new ChatProvider.TranscriptTurn(turns.size() + 1, item.user(), item.replies()));
+        }
+        return new ChatMemoryService.Transcript(List.copyOf(turns), turns.size() + 1, Set.of());
     }
 
     @Scheduled(fixedDelay = 60_000)

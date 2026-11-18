@@ -44,6 +44,8 @@ public class ChatMemoryService {
     private static final Logger log = LoggerFactory.getLogger(ChatMemoryService.class);
     private static final int MAX_PAYLOAD_BYTES = 65_536;
     private static final int MAX_CONTEXT_CODEPOINTS = 6_000;
+    private static final int MAX_TRANSCRIPT_TURNS = 8;
+    private static final int MAX_TRANSCRIPT_UTF8_BYTES = 20_000;
     private static final int MAX_TERMS = 12;
     private static final Duration RAW_RETENTION = Duration.ofDays(60);
     private static final Pattern WORD = Pattern.compile("[\\p{L}\\p{N}]{2,32}");
@@ -52,6 +54,7 @@ public class ChatMemoryService {
 
     public record Saved(ChatDto.Request request, ChatDto.Exchange exchange, String requestHash) { }
     public record HistoryPage(List<Saved> items, String nextCursor) { }
+    public record Transcript(List<ChatProvider.TranscriptTurn> turns, int currentTurn, Set<UUID> exchangeIds) { }
     public record Payload(ChatDto.Request request, ChatDto.Exchange exchange) { }
     private record Row(UUID id, long sequenceId, UUID userId, UUID requestId, UUID studySessionId, String status, String requestHash,
                        String sha256, int bytes, String raw, byte[] compressed,
@@ -132,6 +135,56 @@ public class ChatMemoryService {
         }
     }
 
+    /** Recent successful turns from exactly one owner and room, in completion order. */
+    public Transcript transcript(UUID userId, UUID studySessionId) {
+        if (userId == null) return new Transcript(List.of(), 1, Set.of());
+        String room = studySessionId == null ? "study_session_id IS NULL" : "study_session_id=?";
+        Object[] scope = studySessionId == null ? new Object[] { userId } : new Object[] { userId, studySessionId };
+        String predicate = "user_id=? AND " + room + " AND status='SUCCEEDED' AND NOT EXISTS "
+                + "(SELECT 1 FROM chat_memory_quarantine q WHERE q.memory_id=chat_memory.id)";
+        List<Row> newest = read(() -> jdbc.query("SELECT " + COLUMNS + " FROM chat_memory WHERE " + predicate
+                + " ORDER BY finished_at DESC,sequence_id DESC LIMIT ?", this::row,
+                append(scope, MAX_TRANSCRIPT_TURNS)));
+        List<ChatProvider.TranscriptTurn> reverse = new ArrayList<>();
+        Set<UUID> ids = new LinkedHashSet<>();
+        int usedBytes = 0;
+        for (Row row : newest) {
+            Saved item;
+            try { item = saved(row); }
+            catch (CorruptPayloadException ignored) { continue; }
+            if (!userId.equals(row.userId()) || !java.util.Objects.equals(studySessionId, row.studySessionId())
+                    || !java.util.Objects.equals(studySessionId, item.request().studySessionId())
+                    || !java.util.Objects.equals(studySessionId, item.exchange().studySessionId())
+                    || !"SUCCEEDED".equals(item.exchange().status()) || item.request().content() == null
+                    || item.exchange().utterances() == null || item.exchange().utterances().isEmpty()) continue;
+            List<ChatProvider.Utterance> replies = item.exchange().utterances().stream()
+                    .filter(line -> line != null && line.characterKey() != null && line.content() != null)
+                    .map(line -> new ChatProvider.Utterance(line.characterKey(), line.content())).toList();
+            if (replies.size() != item.exchange().utterances().size()) continue;
+            int bytes = item.request().content().getBytes(StandardCharsets.UTF_8).length;
+            for (ChatProvider.Utterance reply : replies) {
+                bytes += reply.characterKey().getBytes(StandardCharsets.UTF_8).length
+                        + reply.content().getBytes(StandardCharsets.UTF_8).length;
+            }
+            if (usedBytes + bytes > MAX_TRANSCRIPT_UTF8_BYTES) break;
+            usedBytes += bytes;
+            reverse.add(new ChatProvider.TranscriptTurn(0, item.request().content(), replies));
+            ids.add(row.id());
+        }
+        List<ChatProvider.TranscriptTurn> turns = new ArrayList<>();
+        for (int index = reverse.size() - 1; index >= 0; index--) {
+            ChatProvider.TranscriptTurn turn = reverse.get(index);
+            turns.add(new ChatProvider.TranscriptTurn(turns.size() + 1, turn.user(), turn.replies()));
+        }
+        return new Transcript(List.copyOf(turns), turns.size() + 1, Set.copyOf(ids));
+    }
+
+    private static Object[] append(Object[] prefix, Object last) {
+        Object[] values = java.util.Arrays.copyOf(prefix, prefix.length + 1);
+        values[prefix.length] = last;
+        return values;
+    }
+
     /** Opaque, stable (timestamp, sequence) seek pagination; every read is scoped by owner. */
     public HistoryPage history(UUID userId, int limit, String cursor) {
         if (userId == null || limit < 1 || limit > 50) {
@@ -166,15 +219,31 @@ public class ChatMemoryService {
 
     /** A bounded prompt excerpt: recent turns plus up to two older lexical matches. */
     public String context(UUID userId, String currentInput, UUID excludedRequestId) {
+        return context(userId, currentInput, excludedRequestId, Set.of(), false);
+    }
+
+    /** Long-term recall excludes exchanges already present verbatim in the session transcript. */
+    public String context(UUID userId, String currentInput, UUID excludedRequestId, Set<UUID> transcriptIds) {
+        return context(userId, currentInput, excludedRequestId, transcriptIds, true);
+    }
+
+    private String context(UUID userId, String currentInput, UUID excludedRequestId,
+                           Set<UUID> transcriptIds, boolean omitEmpty) {
         if (userId == null) return contextJson(clock.instant(), List.of());
-        List<Row> recent = read(() -> excludedRequestId == null
-                ? jdbc.query("SELECT " + COLUMNS + " FROM chat_memory WHERE user_id=? AND status='SUCCEEDED' AND NOT EXISTS (SELECT 1 FROM chat_memory_quarantine q WHERE q.memory_id=chat_memory.id) ORDER BY finished_at DESC,sequence_id DESC LIMIT 8",
-                        this::row, userId)
-                : jdbc.query("SELECT " + COLUMNS + " FROM chat_memory WHERE user_id=? AND status='SUCCEEDED' AND NOT EXISTS (SELECT 1 FROM chat_memory_quarantine q WHERE q.memory_id=chat_memory.id) AND client_request_id<>? ORDER BY finished_at DESC,sequence_id DESC LIMIT 8",
-                        this::row, userId, excludedRequestId));
+        String exclusion = transcriptIds.isEmpty() ? "" : " AND chat_memory.id NOT IN ("
+                + String.join(",", java.util.Collections.nCopies(transcriptIds.size(), "?")) + ")";
+        List<Object> recentArgs = new ArrayList<>();
+        recentArgs.add(userId);
+        if (excludedRequestId != null) recentArgs.add(excludedRequestId);
+        recentArgs.addAll(transcriptIds);
+        recentArgs.add(8);
+        List<Row> recent = read(() -> jdbc.query("SELECT " + COLUMNS + " FROM chat_memory WHERE user_id=?"
+                + " AND status='SUCCEEDED' AND NOT EXISTS (SELECT 1 FROM chat_memory_quarantine q WHERE q.memory_id=chat_memory.id)"
+                + (excludedRequestId == null ? "" : " AND client_request_id<>?") + exclusion
+                + " ORDER BY finished_at DESC,sequence_id DESC LIMIT ?", this::row, recentArgs.toArray()));
         LinkedHashMap<UUID, Row> selected = new LinkedHashMap<>();
         for (Row row : recent) {
-            selected.put(row.id(), row);
+            if (!transcriptIds.contains(row.id())) selected.put(row.id(), row);
         }
         Set<String> clues = terms(currentInput);
         if (!clues.isEmpty()) {
@@ -182,8 +251,11 @@ public class ChatMemoryService {
             List<Object> args = new ArrayList<>();
             args.add(userId);
             for (String term : clues) args.add(sha(term.getBytes(StandardCharsets.UTF_8)));
+            args.addAll(transcriptIds);
             args.add(12);
-            List<UUID> matches = read(() -> jdbc.query("SELECT t.memory_id FROM chat_memory_terms t JOIN chat_memory m ON m.user_id=t.user_id AND m.id=t.memory_id WHERE t.user_id=? AND m.status='SUCCEEDED' AND NOT EXISTS (SELECT 1 FROM chat_memory_quarantine q WHERE q.memory_id=m.id) AND t.term_hash IN (" + placeholders + ") GROUP BY t.memory_id ORDER BY COUNT(*) DESC,MAX(m.finished_at) DESC,MAX(m.sequence_id) DESC LIMIT ?",
+            String matchExclusion = transcriptIds.isEmpty() ? "" : " AND m.id NOT IN ("
+                    + String.join(",", java.util.Collections.nCopies(transcriptIds.size(), "?")) + ")";
+            List<UUID> matches = read(() -> jdbc.query("SELECT t.memory_id FROM chat_memory_terms t JOIN chat_memory m ON m.user_id=t.user_id AND m.id=t.memory_id WHERE t.user_id=? AND m.status='SUCCEEDED' AND NOT EXISTS (SELECT 1 FROM chat_memory_quarantine q WHERE q.memory_id=m.id) AND t.term_hash IN (" + placeholders + ")" + matchExclusion + " GROUP BY t.memory_id ORDER BY COUNT(*) DESC,MAX(m.finished_at) DESC,MAX(m.sequence_id) DESC LIMIT ?",
                     (rs, index) -> PortableJdbc.uuid(rs, 1), args.toArray()));
             if (!matches.isEmpty()) {
                 String ids = String.join(",", java.util.Collections.nCopies(matches.size(), "?"));
@@ -196,7 +268,8 @@ public class ChatMemoryService {
                 int added = 0;
                 for (UUID id : matches) {
                     Row row = byId.get(id);
-                    if (row != null && !row.requestId().equals(excludedRequestId) && !selected.containsKey(row.id()) && added < 2) {
+                    if (row != null && !row.requestId().equals(excludedRequestId) && !transcriptIds.contains(row.id())
+                            && !selected.containsKey(row.id()) && added < 2) {
                         selected.put(row.id(), row);
                         added++;
                     }
@@ -223,7 +296,7 @@ public class ChatMemoryService {
             String candidate = contextJson(asOf, excerpts);
             if (candidate.codePointCount(0, candidate.length()) > MAX_CONTEXT_CODEPOINTS) excerpts.remove(excerpts.size() - 1);
         }
-        return contextJson(asOf, excerpts);
+        return omitEmpty && excerpts.isEmpty() ? null : contextJson(asOf, excerpts);
     }
 
     /** Archives only rows strictly older than 60 days, in bounded, locked batches. */

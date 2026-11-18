@@ -43,7 +43,7 @@ ganzi:
     response-deadline-seconds: ${GANZI_CHAT_RESPONSE_DEADLINE_SECONDS:30}
   openai:
     api-key: ${OPENAI_API_KEY:}
-    model: ${GANZI_OPENAI_MODEL:gpt-6.1-sol}
+    model: ${GANZI_OPENAI_MODEL:gpt-6.2-sol}
     reasoning-effort: ${GANZI_OPENAI_REASONING_EFFORT:}
     timeout-seconds: ${GANZI_OPENAI_TIMEOUT_SECONDS:20}
     max-output-tokens: ${GANZI_OPENAI_MAX_OUTPUT_TOKENS:2048}

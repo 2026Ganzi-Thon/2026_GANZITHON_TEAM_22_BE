@@ -6,6 +6,9 @@ import java.util.List;
 public interface ChatProvider {
     default void ensureConfigured() { }
 
+    /** Only providers that serialize sessionTranscript should opt in. */
+    default boolean usesSessionTranscript() { return false; }
+
     default Reply generate(Turn turn) {
         return generate(turn.userContent(), turn.previousUserContent(), turn.previousAssistantContent(),
             turn.characterKeys(), turn.studyState(), turn.memoryContext());
@@ -52,9 +55,22 @@ public interface ChatProvider {
 
     /** The same server-selected generation input is used for estimation and the paid call. */
     record Turn(String userContent, String previousUserContent, String previousAssistantContent,
-                List<String> characterKeys, String studyState, String memoryContext, boolean focusedPrompt) {}
+                List<String> characterKeys, String studyState, String memoryContext, boolean focusedPrompt,
+                List<TranscriptTurn> sessionTranscript, int currentTurn) {
+        public Turn(String userContent, String previousUserContent, String previousAssistantContent,
+                    List<String> characterKeys, String studyState, String memoryContext, boolean focusedPrompt) {
+            this(userContent, previousUserContent, previousAssistantContent, characterKeys, studyState,
+                memoryContext, focusedPrompt, List.of(), 1);
+        }
+    }
+    /** A completed exchange from this user's current room, with original speaker text. */
+    record TranscriptTurn(int turn, String user, List<Utterance> replies) {}
     record Utterance(String characterKey, String content) {}
-    record Usage(long inputTokens, long cachedInputTokens, long outputTokens) {}
+    record Usage(long inputTokens, long cachedInputTokens, long outputTokens, long cacheWriteInputTokens) {
+        public Usage(long inputTokens, long cachedInputTokens, long outputTokens) {
+            this(inputTokens, cachedInputTokens, outputTokens, 0);
+        }
+    }
     record CostQuote(String model, long maxInputTokens, int maxOutputTokens) {}
     record Reply(List<Utterance> utterances, Usage usage) {
         public Reply(List<Utterance> utterances) { this(utterances, null); }

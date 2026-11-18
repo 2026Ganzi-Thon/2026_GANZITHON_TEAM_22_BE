@@ -180,7 +180,7 @@ api.components.schemas.ChatUsageDTO = { type: 'object', additionalProperties: fa
   required: ['timeZone', 'daily', 'monthly', 'dailyRequestLimit', 'availability'] };
 paths['/api/v1/chat/usage'] = { get: {
   operationId: 'A25_getChatUsage', tags: ['chat'], summary: '내 AI 사용량과 요청 가능 상태 조회',
-  description: 'UTC 일·달력 월 기준 본인 사용량이다. requests와 토큰은 저장된 본인 요청만 집계하고 estimatedUsd는 앱 scope의 보수적 추정치다. reservedUsd는 과금 결과가 아직 불확실한 예약액이다. 캐시 토큰 할인을 반영하지 않는다. 앱 전체 한도나 OpenAI 계정의 실시간 잔액은 이 응답에 없다.',
+  description: 'UTC 일·달력 월 기준 본인 사용량이다. requests와 토큰은 저장된 본인 요청만 집계하고 estimatedUsd는 앱 scope의 보수적 추정치다. reservedUsd는 과금 결과가 아직 불확실한 예약액이다. 6.2 Sol은 정산할 때 일반 입력, 캐시 읽기, 캐시 쓰기, 출력 토큰을 각 단가로 계산한다. 앱 전체 한도나 OpenAI 계정의 실시간 잔액은 이 응답에 없다.',
   responses: { '200': jsonResponse('내 일별·월별 AI 사용량', 'ChatUsageDTO'),
     '401': errorRef('401'), '429': errorRef('429'), '500': errorRef('500') }
 } };
