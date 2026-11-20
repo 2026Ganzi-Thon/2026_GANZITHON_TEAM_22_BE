@@ -368,6 +368,12 @@ class ChatBudgetIntegrationTest {
         assertEquals("CHAT_RESULT_UNAVAILABLE", chat(provider, configuredBudget).create(user, request).failureCode());
         assertTrue(memory.find(user, request.clientRequestId()).isEmpty());
         verify(failingMemory, times(3)).save(eq(user), eq(request), any(), anyString());
+        org.mockito.Mockito.reset(failingMemory);
+        var restored = service.create(user, request);
+        assertEquals("SUCCEEDED", restored.status());
+        assertEquals(failed.id(), restored.id());
+        assertEquals(restored, memory.find(user, request.clientRequestId()).orElseThrow().exchange());
+        assertEquals(restored, chat(provider, configuredBudget).recover(user, request.clientRequestId()).items().getFirst());
         assertEquals(1, calls.get());
         assertSol62Charge(user, request.clientRequestId());
     }
@@ -618,8 +624,24 @@ class ChatBudgetIntegrationTest {
         assertEquals("AI_USAGE_EXCEEDED_RESERVATION", blocked.code());
     }
 
+    @Test
+    void availabilityReportsMissingProviderAndOnlyProvableBudgetShortfalls() {
+        UUID owner = user();
+        assertEquals("CHAT_NOT_CONFIGURED", configuredBudget.usage(owner).availability());
+        ChatProvider provider = mock(ChatProvider.class);
+        when(provider.minimumReservationQuote()).thenReturn(QUOTE); // 30,000 nano-USD
+        for (String[] caps : List.of(new String[]{"0.000029999", "1"},
+                new String[]{"1", "0.000029999"}, new String[]{"0.000030000", "0.000030000"})) {
+            var budget = new ChatBudgetService(jdbc, clock, scope(), new BigDecimal(caps[0]),
+                    new BigDecimal(caps[1]), 100, 1, provider);
+            assertEquals(caps[0].equals(caps[1]) ? "AVAILABLE" : "AI_BUDGET_EXCEEDED",
+                    budget.usage(owner).availability());
+        }
+    }
+
     private ChatBudgetService budget(String scope, String day, String month, int perUser, long epoch) {
-        return new ChatBudgetService(jdbc, clock, scope, new BigDecimal(day), new BigDecimal(month), perUser, epoch);
+        return new ChatBudgetService(jdbc, clock, scope, new BigDecimal(day), new BigDecimal(month), perUser, epoch,
+                mock(ChatProvider.class));
     }
 
     private <T> T tx(java.util.function.Supplier<T> action) {

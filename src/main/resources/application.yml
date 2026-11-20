@@ -28,6 +28,7 @@ ganzi:
     days: 30
   chat:
     enabled: ${GANZI_CHAT_ENABLED:false}
+    safety-support-enabled: ${GANZI_CHAT_SAFETY_SUPPORT_ENABLED:false}
     intent-routing-enabled: ${GANZI_CHAT_INTENT_ROUTING_ENABLED:true}
     provider: openai
     memory:

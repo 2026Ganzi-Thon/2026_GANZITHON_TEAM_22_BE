@@ -2,7 +2,7 @@
 set -eu
 
 script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
-region=${AWS_REGION:-ap-southeast-2}
+region=${AWS_REGION:-ap-northeast-2}
 case "$region" in
     ''|*[!a-z0-9-]*) echo "Invalid AWS_REGION: $region" >&2; exit 1 ;;
 esac

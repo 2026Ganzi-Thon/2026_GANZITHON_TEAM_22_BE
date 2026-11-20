@@ -105,17 +105,22 @@ public class StudyAwayDispatcher {
         List<State> rows=jdbc.query("SELECT p.delivery_status,s.status AS study_status,p.state,d.expo_push_token "
                         + "FROM study_app_presence p JOIN study_sessions s ON s.id=p.session_id AND s.user_id=p.user_id "
                         + "JOIN push_devices d ON d.installation_id=p.installation_id AND d.user_id=p.user_id "
-                        + "WHERE p.user_id=? AND p.session_id=? AND p.installation_id=?",
+                        + "LEFT JOIN auth_sessions a ON a.id=d.auth_session_id AND a.user_id=d.user_id "
+                        + "WHERE p.user_id=? AND p.session_id=? AND p.installation_id=? "
+                        + "AND a.revoked_at IS NULL AND a.expires_at>?",
                 (rs,row)->new State(rs.getString("delivery_status"),rs.getString("study_status"),
                         rs.getString("state"),rs.getString("expo_push_token")),
-                c.userId(),c.sessionId(),c.installationId());
+                c.userId(),c.sessionId(),c.installationId(),now());
         return rows.isEmpty()?null:rows.getFirst();
     }
 
     private boolean hasForeground(Candidate c) {
-        return !jdbc.queryForList("SELECT installation_id FROM study_app_presence "
-                        + "WHERE user_id=? AND session_id=? AND state='FOREGROUND' LIMIT 1",
-                UUID.class,c.userId(),c.sessionId()).isEmpty();
+        return !jdbc.queryForList("SELECT p.installation_id FROM study_app_presence p "
+                        + "JOIN push_devices d ON d.installation_id=p.installation_id AND d.user_id=p.user_id "
+                        + "LEFT JOIN auth_sessions a ON a.id=d.auth_session_id AND a.user_id=d.user_id "
+                        + "WHERE p.user_id=? AND p.session_id=? AND p.state='FOREGROUND' "
+                        + "AND a.revoked_at IS NULL AND a.expires_at>? LIMIT 1",
+                UUID.class,c.userId(),c.sessionId(),now()).isEmpty();
     }
     private void cancel(Candidate c) {
         jdbc.update("UPDATE study_app_presence SET delivery_status='CANCELED',due_at=NULL,claim_id=NULL,"

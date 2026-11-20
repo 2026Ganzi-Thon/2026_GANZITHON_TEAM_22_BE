@@ -202,6 +202,14 @@ function summarizeTests() {
   const folder = path.join(work, 'build', 'test-results', 'test');
   const files = fs.readdirSync(folder).filter(name => /^TEST-.*\.xml$/.test(name));
   const totals = { suites: files.length, tests: 0, failures: 0, errors: 0, skipped: 0 };
+  const criticalSuites = new Map([
+    ['BackendApiIntegrationTest', 14], ['EmailAuthIntegrationTest', 7],
+    ['IdentityDeletionIntegrationTest', 5], ['ReminderApiIntegrationTest', 8],
+    ['StudyAwayApiIntegrationTest', 5], ['ChatBudgetIntegrationTest', 19],
+    ['ChatMemoryIntegrationTest', 8], ['ChatLongMemoryApiIntegrationTest', 3],
+    ['StagingDatabaseMigrationTest', 3],
+  ].map(([name, count]) => [`kr.ganzithon.backend.${name}`, count]));
+  const suiteCounts = new Map();
   for (const name of files) {
     const text = fs.readFileSync(path.join(folder, name), 'utf8');
     const tag = text.match(/<testsuite\b([^>]*)>/)?.[1];
@@ -210,10 +218,15 @@ function summarizeTests() {
       const value = tag.match(new RegExp(`\\b${field}="(\\d+)"`))?.[1];
       if (value === undefined) fail(`Gradle 시험 결과에 ${field} 필드가 없습니다.`);
       totals[field] += Number(value);
+      if (field === 'tests') suiteCounts.set(name.slice(5, -4), Number(value));
     }
   }
-  if (totals.suites < 25 || totals.tests < 133 || totals.failures || totals.errors || totals.skipped)
-    fail(`자동 시험 결과가 예상과 다릅니다: ${totals.tests}개 중 실패 ${totals.failures}, 오류 ${totals.errors}, 건너뜀 ${totals.skipped}`);
+  for (const [name, minimum] of criticalSuites) {
+    const actual = suiteCounts.get(name) ?? 0;
+    if (actual < minimum) fail(`핵심 시험 ${name} 실행 수 부족: ${actual}/${minimum}`);
+  }
+  if (totals.suites < 30 || totals.tests < 165 || totals.failures || totals.errors || totals.skipped)
+    fail(`자동 시험 결과가 예상과 다릅니다: 묶음 ${totals.suites}/최소 30개, 시험 ${totals.tests}/최소 165개, 실패 ${totals.failures}, 오류 ${totals.errors}, 건너뜀 ${totals.skipped}`);
   return totals;
 }
 async function stopMysql() {
@@ -275,20 +288,27 @@ try {
   await runChecked(process.execPath, [path.join(work, 'scripts', 'smoke.mjs')], env, 'HTTP 점검');
   checkAbort();
   const smoke = JSON.parse(fs.readFileSync(path.join(work, 'build', 'smoke-result.json'), 'utf8'));
-  if (!smoke.passed || smoke.implementedOperations !== 33 || !Array.isArray(smoke.checks)
-      || smoke.checks.length < 24) fail('HTTP 점검 결과가 예상과 다릅니다.');
-  result.smoke = { passed: true, operations: smoke.implementedOperations, checks: smoke.checks.length };
+  if (!smoke.passed || !Array.isArray(smoke.checks) || smoke.checks.length < 24
+      || !Array.isArray(smoke.exercisedOperations) || !Array.isArray(smoke.unexercisedOperations)
+      || smoke.implementedOperations < 1
+      || smoke.exercisedOperations.length + smoke.unexercisedOperations.length !== smoke.implementedOperations)
+    fail('HTTP 점검 결과가 예상과 다릅니다.');
+  result.smoke = { passed: true, operations: smoke.implementedOperations,
+    exercisedOperations: smoke.exercisedOperations, unexercisedOperations: smoke.unexercisedOperations,
+    checks: smoke.checks.length };
   console.log('Flyway로 생성한 빈 DB에서 staging 프로필의 핵심 HTTP 흐름을 점검합니다.');
   await runChecked(process.execPath, [path.join(work, 'scripts', 'staging-smoke.mjs')], env, 'Staging HTTP 점검');
   checkAbort();
   const stagingSmoke = JSON.parse(fs.readFileSync(path.join(work, 'build', 'staging-smoke-result.json'), 'utf8'));
-  const expectedMigrations = fs.readdirSync(path.join(work, 'src', 'main', 'resources', 'db', 'migration'))
-    .filter(name => /^V\d+__.*\.sql$/.test(name)).length;
-  const migrationCheck = mysqlCommand(`SELECT COUNT(*) FROM \`${databases.staging}\`.flyway_schema_history WHERE success=1;`);
-  stagingSmoke.flywayVerified = expectedMigrations > 0 && migrationCheck.status === 0
-    && Number(migrationCheck.stdout.trim()) === expectedMigrations;
-  stagingSmoke.expectedMigrations = expectedMigrations;
-  stagingSmoke.appliedMigrations = migrationCheck.status === 0 ? Number(migrationCheck.stdout.trim()) : null;
+  const expectedVersions = fs.readdirSync(path.join(work, 'src', 'main', 'resources', 'db', 'migration'))
+    .map(name => name.match(/^V(\d+)__.*\.sql$/)?.[1]).filter(Boolean).sort();
+  const migrationCheck = mysqlCommand(`SELECT CONCAT(version, ':', success) FROM \`${databases.staging}\`.flyway_schema_history WHERE version IS NOT NULL;`);
+  const appliedVersions = migrationCheck.status === 0
+    ? migrationCheck.stdout.trim().split(/\r?\n/).filter(Boolean).sort() : null;
+  stagingSmoke.flywayVerified = expectedVersions.length > 0 && appliedVersions !== null
+    && expectedVersions.map(version => `${version}:1`).join(',') === appliedVersions.join(',');
+  stagingSmoke.expectedMigrations = expectedVersions.length;
+  stagingSmoke.appliedMigrations = appliedVersions?.filter(row => row.endsWith(':1')).length ?? null;
   if (!stagingSmoke.passed || stagingSmoke.profile !== 'staging' || !stagingSmoke.flywayVerified
       || stagingSmoke.requestCount < 18)
     fail('Staging HTTP 점검 결과가 예상과 다릅니다.');
@@ -297,7 +317,7 @@ try {
   result.schemaParity = compareSchemaSnapshots(
     schemaSnapshot(mysqlRows, databases.staging), schemaSnapshot(mysqlRows, databases.smoke));
   result.passed = true;
-  console.log(`HTTP API ${result.smoke.operations}개와 staging 핵심 흐름 및 스키마 일치 점검 완료.`);
+  console.log(`OpenAPI 연산 ${result.smoke.operations}개 중 HTTP 호출 ${result.smoke.exercisedOperations.length}개, staging 핵심 흐름 및 스키마 일치 점검 완료.`);
 } catch (error) {
   result.error = String(error?.message ?? error);
   console.error(result.error);

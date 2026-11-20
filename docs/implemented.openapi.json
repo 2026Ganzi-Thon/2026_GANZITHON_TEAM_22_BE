@@ -199,6 +199,12 @@
           },
           "subtaskSummary": {
             "$ref": "#/components/schemas/SubtaskSummary"
+          },
+          "version": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0,
+            "description": "할 일 자체의 편집 버전. 기존 행은 0부터 시작한다. 세부 할 일 편집은 포함하지 않는다."
           }
         },
         "required": [
@@ -210,7 +216,8 @@
           "completedAt",
           "createdAt",
           "updatedAt",
-          "subtaskSummary"
+          "subtaskSummary",
+          "version"
         ]
       },
       "SubtaskSummary": {
@@ -275,6 +282,11 @@
                 "type": "null"
               }
             ]
+          },
+          "clientRequestId": {
+            "type": "string",
+            "format": "uuid",
+            "description": "선택. 같은 사용자가 같은 경로와 정규화된 입력으로 재시도할 때 동일 생성 결과를 찾는 UUID."
           }
         },
         "required": [
@@ -366,6 +378,12 @@
             "items": {
               "$ref": "#/components/schemas/SubtaskDTO"
             }
+          },
+          "version": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0,
+            "description": "할 일 자체의 편집 버전. 기존 행은 0부터 시작한다. 세부 할 일 편집은 포함하지 않는다."
           }
         },
         "required": [
@@ -378,7 +396,8 @@
           "createdAt",
           "updatedAt",
           "subtaskSummary",
-          "subtasks"
+          "subtasks",
+          "version"
         ]
       },
       "SubtaskDTO": {
@@ -477,11 +496,39 @@
               "TODO",
               "DONE"
             ]
+          },
+          "expectedVersion": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0,
+            "description": "선택. 조회한 할 일의 version. 다른 편집이 먼저 저장됐다면 409 TASK_VERSION_CONFLICT."
           }
         },
         "required": [],
         "minProperties": 1,
-        "description": "제공한 필드만 변경한다. null은 description/dueDate에만 허용."
+        "description": "제공한 필드만 변경한다. null은 description/dueDate에만 허용.",
+        "anyOf": [
+          {
+            "required": [
+              "title"
+            ]
+          },
+          {
+            "required": [
+              "description"
+            ]
+          },
+          {
+            "required": [
+              "dueDate"
+            ]
+          },
+          {
+            "required": [
+              "status"
+            ]
+          }
+        ]
       },
       "SubtaskCreateRequest": {
         "type": "object",
@@ -491,6 +538,11 @@
             "type": "string",
             "maxLength": 120,
             "minLength": 1
+          },
+          "clientRequestId": {
+            "type": "string",
+            "format": "uuid",
+            "description": "선택. 같은 사용자가 같은 경로와 정규화된 입력으로 재시도할 때 동일 생성 결과를 찾는 UUID."
           }
         },
         "required": [
@@ -575,7 +627,8 @@
           },
           "studySeconds": {
             "type": "integer",
-            "minimum": 0
+            "minimum": 0,
+            "description": "응답이 가리키는 세션의 공부 시간(초). 휴식 시간과 이전 세션은 제외한다."
           },
           "runningStartedAt": {
             "anyOf": [
@@ -599,6 +652,25 @@
           "serverTime": {
             "type": "string",
             "format": "date-time"
+          },
+          "priorTaskStudySeconds": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0,
+            "description": "이 세션 시작 시각까지 종료된 본인의 같은 할 일 세션들의 합계(초). 이번 세션을 제외하고, 합산한 밀리초를 초로 내림한다. taskId=null이면 0이다. 이어 재는 화면은 이 값과 이번 세션의 표시 시간을 더한다."
+          },
+          "totalTaskStudySeconds": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "format": "int64",
+                "minimum": 0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "같은 할 일의 종료 세션과 현재 세션의 밀리초를 먼저 합산한 뒤 한 번만 초로 내린 누적 공부 시간. taskId=null이면 null. 할 일 화면의 누적 시간에는 이 필드를 사용한다."
           }
         },
         "required": [
@@ -612,7 +684,9 @@
           "runningStartedAt",
           "startRequestId",
           "version",
-          "serverTime"
+          "serverTime",
+          "priorTaskStudySeconds",
+          "totalTaskStudySeconds"
         ],
         "description": "taskId=null은 할 일 없이 시작했거나 연결된 할 일이 삭제된 경우다."
       },
@@ -1196,8 +1270,10 @@
           },
           "availability": {
             "type": "string",
+            "description": "AVAILABLE은 조회 시점에 확인된 차단 사유가 없다는 뜻이다. 실제 요청의 문맥·예약액과 동시 사용량에 따라 접수가 거절될 수 있다. 제공자가 없거나 설정이 유효하지 않으면 CHAT_NOT_CONFIGURED, 일·월 잔여 예산이 확실한 예약 하한보다 작으면 AI_BUDGET_EXCEEDED다.",
             "enum": [
               "AVAILABLE",
+              "CHAT_NOT_CONFIGURED",
               "AI_BUDGET_EXCEEDED",
               "AI_DAILY_USAGE_EXCEEDED",
               "AI_CREDIT_EXHAUSTED",
@@ -1822,6 +1898,32 @@
         ],
         "summary": "할 일 생성",
         "responses": {
+          "200": {
+            "description": "같은 clientRequestId의 생성 결과 재조회",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TaskDTO"
+                },
+                "example": {
+                  "id": "20000000-0000-4000-8000-000000000001",
+                  "title": "발표 준비",
+                  "description": "자료 읽기",
+                  "dueDate": "2026-11-10",
+                  "status": "TODO",
+                  "completedAt": null,
+                  "createdAt": "2026-11-01T13:00:00Z",
+                  "updatedAt": "2026-11-01T13:00:00Z",
+                  "subtaskSummary": {
+                    "total": 0,
+                    "done": 0,
+                    "ratio": null
+                  },
+                  "version": 0
+                }
+              }
+            }
+          },
           "201": {
             "description": "성공",
             "content": {
@@ -1842,7 +1944,8 @@
                     "total": 0,
                     "done": 0,
                     "ratio": null
-                  }
+                  },
+                  "version": 0
                 }
               }
             }
@@ -1855,6 +1958,9 @@
           },
           "406": {
             "$ref": "#/components/responses/406"
+          },
+          "409": {
+            "$ref": "#/components/responses/409"
           },
           "415": {
             "$ref": "#/components/responses/415"
@@ -1880,7 +1986,8 @@
               }
             }
           }
-        }
+        },
+        "description": "clientRequestId를 생략하면 매 요청마다 새 항목을 만들고 201을 반환한다. 제공하면 최초 생성은 201, 같은 요청의 재시도는 현재 항목과 200을 반환한다. 같은 ID로 다른 입력이나 부모를 요청하면 409 CLIENT_REQUEST_ID_REUSED, 생성 결과가 삭제됐다면 409 CREATE_RESULT_DELETED를 반환한다."
       },
       "get": {
         "operationId": "A05_listTasks",
@@ -2043,7 +2150,8 @@
               "format": "uuid"
             }
           }
-        ]
+        ],
+        "description": "제공한 할 일 필드만 변경한다. expectedVersion을 주면 현재 버전과 비교해 경쟁 편집을 막는다. 실제 변경이 없으면 version과 updatedAt을 유지하며, expectedVersion만 보낸 요청은 400이다. 같은 expectedVersion의 수정 요청을 성공 후 재시도하면 버전 충돌 409가 정상이다. 세부 할 일 편집에는 이 버전이 적용되지 않는다."
       },
       "delete": {
         "operationId": "A08_deleteTask",
@@ -2096,6 +2204,16 @@
         ],
         "summary": "수동 하위 할 일 생성",
         "responses": {
+          "200": {
+            "description": "같은 clientRequestId의 생성 결과 재조회",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SubtaskDTO"
+                }
+              }
+            }
+          },
           "201": {
             "description": "성공",
             "content": {
@@ -2151,7 +2269,8 @@
               "format": "uuid"
             }
           }
-        ]
+        ],
+        "description": "clientRequestId를 생략하면 매 요청마다 새 항목을 만들고 201을 반환한다. 제공하면 최초 생성은 201, 같은 요청의 재시도는 현재 항목과 200을 반환한다. 같은 ID로 다른 입력이나 부모를 요청하면 409 CLIENT_REQUEST_ID_REUSED, 생성 결과가 삭제됐다면 409 CREATE_RESULT_DELETED를 반환한다."
       }
     },
     "/api/v1/tasks/{taskId}/subtasks/{subtaskId}": {
@@ -2316,7 +2435,9 @@
                   "runningStartedAt": "2026-11-01T13:05:00Z",
                   "startRequestId": "90000000-0000-4000-8000-000000000001",
                   "version": 0,
-                  "serverTime": "2026-11-01T13:05:00Z"
+                  "serverTime": "2026-11-01T13:05:00Z",
+                  "priorTaskStudySeconds": 0,
+                  "totalTaskStudySeconds": null
                 }
               }
             }
@@ -2666,10 +2787,10 @@
           "identity"
         ],
         "summary": "현재 세션 로그아웃",
-        "description": "Bearer로 지정된 현재 인증 세션만 폐기한다. 요청 본문은 허용하지 않는다. 다른 기기의 세션과 사용자 데이터는 유지한다.",
+        "description": "요청 본문 없이 현재 Bearer로 호출한다. 현재 인증 세션과 그 세션에 연결된 푸시 설치 및 해당 설치의 앱 상태·대기 알림을 함께 해제한다. 다른 인증 세션·푸시 설치와 사용자 데이터는 유지한다.",
         "responses": {
           "204": {
-            "description": "현재 세션 폐기. 응답 본문 없음."
+            "description": "현재 세션 폐기 및 연결된 설치 해제. 응답 본문 없음."
           },
           "400": {
             "$ref": "#/components/responses/400"
@@ -2693,7 +2814,7 @@
           "identity"
         ],
         "summary": "이메일 계정 비밀번호 변경",
-        "description": "현재 Bearer와 기존 비밀번호를 확인한다. 성공하면 해당 사용자에게 발급된 모든 이전 인증 세션을 폐기하고 새 토큰을 발급한다. 게스트 계정이나 틀린 기존 비밀번호는 401 INVALID_CREDENTIALS다.",
+        "description": "현재 Bearer와 기존 비밀번호를 확인한다. 성공하면 이전 인증 토큰을 모두 폐기하고 새 토큰을 발급한다. 현재 세션에 연결된 푸시 설치는 새 토큰에 연결된다. 폐기되는 다른 세션에 연결된 푸시 설치와 앱 상태·대기 알림은 해제한다. 게스트 계정이나 틀린 기존 비밀번호는 401 INVALID_CREDENTIALS다.",
         "requestBody": {
           "required": true,
           "content": {
@@ -2817,6 +2938,16 @@
           "415": {
             "$ref": "#/components/responses/415"
           },
+          "422": {
+            "description": "팀 QA 설정을 켠 경우의 CHAT_SAFETY_SUPPORT. 기존 한국어 안내를 message에 반환하며 retryable은 false다. 모델 호출·요금 예약·새 대화 저장이 없다.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorDTO"
+                }
+              }
+            }
+          },
           "429": {
             "$ref": "#/components/responses/429"
           },
@@ -2824,7 +2955,14 @@
             "$ref": "#/components/responses/500"
           },
           "503": {
-            "$ref": "#/components/responses/503"
+            "description": "CHAT_NOT_CONFIGURED는 서버 설정을 완료해야 하며 retryable=false다. 이때 앱은 대기를 끝낸다. 일시적인 저장·승인 오류는 해당 오류 코드와 retryable을 확인한다.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorDTO"
+                }
+              }
+            }
           }
         }
       },
@@ -3038,7 +3176,7 @@
             }
           }
         },
-        "description": "새 예약은 본인의 가장 최근 ENDED 공부에서 7일 이내 미래 시각으로 지정한다. 같은 입력을 다시 보내면 200으로 저장된 상태를 반환하며 CANCELED 또는 EXPIRED 상태도 그대로 반환한다. 앱은 반환된 상태가 ACTIVE일 때만 단말 OS 알림을 예약한다. 소유 계정이 이미 삭제되었으면 401 AUTH_REQUIRED다. HTTP 409는 REMINDER_REQUEST_CONFLICT, ACTIVE_REMINDER_EXISTS, REMINDER_SOURCE_AMBIGUOUS, REMINDER_SOURCE_NOT_LATEST, STUDY_NOT_ENDED 등 업무 조건 충돌이다. 잠금 경합으로 예약을 완료하지 못하면 503 REMINDER_TEMPORARILY_UNAVAILABLE과 retryable=true를 반환한다. 앱은 같은 경로와 본문으로 다시 요청할 수 있다.",
+        "description": "새 예약은 본인의 가장 최근 공부가 ENDED일 때 그 세션에서 7일 이내 미래 시각으로 지정한다. 같은 세션의 저장된 시각과 시간대를 PUT으로 보내면 200으로 기존 상태를 반환하며 CANCELED 또는 EXPIRED도 그대로 반환한다. 다른 값으로 PUT하면 409 REMINDER_REQUEST_CONFLICT다. ACTIVE 상태의 시각과 시간대를 바꾸려면 PATCH /api/v1/start-reminders/{reminderId}를 사용한다. CANCELED 또는 EXPIRED 예약은 이 세션에서 다시 활성화할 수 없다. 앱은 반환된 상태가 ACTIVE일 때만 단말 OS 알림을 예약한다. 소유 계정이 이미 삭제되었으면 401 AUTH_REQUIRED다. HTTP 409에는 ACTIVE_REMINDER_EXISTS, REMINDER_SOURCE_AMBIGUOUS, REMINDER_SOURCE_NOT_LATEST, STUDY_NOT_ENDED도 포함된다. 잠금 경합으로 예약을 완료하지 못하면 503 REMINDER_TEMPORARILY_UNAVAILABLE과 retryable=true를 반환한다. 앱은 같은 경로와 본문으로 다시 요청할 수 있다.",
         "requestBody": {
           "required": true,
           "content": {
@@ -3284,7 +3422,7 @@
           "reminders"
         ],
         "summary": "내 앱 설치의 Expo 푸시 토큰 등록 또는 갱신",
-        "description": "installationId는 앱 설치마다 생성·보관하는 UUID다. 같은 사용자·설치에서 등록을 반복하거나 토큰을 갱신할 수 있다. 앱 재설치 등으로 같은 사용자의 Expo 토큰을 새로운 installationId로 등록하면 이전 설치 기록과 그 설치의 대기 중 앱 상태·알림을 삭제한 뒤 새 설치로 옮긴다. HTTP 409 코드는 다른 사용자 소유 설치 ID의 PUSH_DEVICE_OWNERSHIP_CONFLICT, 다른 사용자 소유 토큰의 PUSH_TOKEN_OWNERSHIP_CONFLICT, 동시 등록 충돌의 PUSH_DEVICE_CONFLICT다. 서버의 원격 푸시 전송은 GANZI_PUSH_ENABLED=false가 기본이며, 이 응답은 실제 알림 수신을 보증하지 않는다.",
+        "description": "installationId는 앱 설치마다 생성·보관하는 UUID다. 현재 Bearer 세션에 설치 하나를 연결하며, 같은 세션과 설치에서 재등록하거나 토큰을 갱신할 수 있다. 같은 세션이 같은 Expo 토큰을 새 설치 UUID로 등록하면 기존 설치와 그 설치의 앱 상태·대기 알림을 삭제한다. 세션 연결이 없거나 연결된 인증이 만료된 설치는 소유 계정이 동일한 설치 UUID와 저장된 Expo 토큰으로 재등록해 연결할 수 있다. 새 세션에 연결하면 해당 설치의 이전 공부 이탈 상태가 정리된다. HTTP 409 코드는 다른 사용자 소유 설치의 PUSH_DEVICE_OWNERSHIP_CONFLICT, 다른 사용자 소유 토큰의 PUSH_TOKEN_OWNERSHIP_CONFLICT, 같은 계정 내 세션 불일치 또는 기존 설치 확인 실패의 PUSH_DEVICE_SESSION_CONFLICT, 세션의 다른 설치 등록 또는 동시 등록 충돌의 PUSH_DEVICE_CONFLICT다. 원격 푸시 전송은 GANZI_PUSH_ENABLED=false가 기본이다.",
         "parameters": [
           {
             "name": "installationId",
@@ -3346,7 +3484,7 @@
           "reminders"
         ],
         "summary": "내 앱 설치의 푸시 토큰 해제",
-        "description": "본인 소유의 설치 기록만 삭제한다. 존재하지 않거나 다른 사용자 소유인 설치 ID에도 존재 여부를 숨기기 위해 204를 반환한다.",
+        "description": "현재 Bearer 세션에 연결된 설치만 해제한다. 없는 설치 또는 현재 세션과 연결되지 않은 설치에도 204를 반환한다.",
         "parameters": [
           {
             "name": "installationId",
@@ -3385,7 +3523,7 @@
           "reminders"
         ],
         "summary": "공부 중 앱 전경·배경 상태 보고",
-        "description": "앱이 공부 중 BACKGROUND를 보고하면 서버 시각 5분 뒤 확인 알림을 예약한다. 같은 eventId와 동일 입력의 재전송은 200이며, 새로운 BACKGROUND를 반복 보고해도 첫 이탈 시각은 유지된다. FOREGROUND 복귀 또는 공부 일시 정지·종료는 대기 중 알림을 취소한다. HTTP 409 코드는 동일 eventId에 다른 입력을 사용한 PRESENCE_EVENT_REUSED, 이전 이하의 sequence를 보낸 PRESENCE_SEQUENCE_CONFLICT, 공부가 STUDYING이 아닌 상태에서 BACKGROUND를 보낸 STUDY_NOT_RUNNING이다. 서버는 앱 강제 종료를 항상 감지할 수 없으므로 클라이언트가 앱 상태 전환을 보고해야 한다. deliveryEnabled=false에서는 PENDING이어도 원격 푸시는 발송하지 않는다. 원격 푸시 전송은 서버 설정으로 별도 활성화해야 한다.",
+        "description": "현재 Bearer 세션에 연결된 설치에서만 앱 상태를 보고할 수 있다. 이전 버전에서 이관된 기기는 같은 계정으로 다시 등록한 뒤 상태를 보고한다. 재연결 전에는 해당 기기로 공부 이탈 푸시를 보내거나 그 기기의 전경 상태로 다른 기기의 알림을 막지 않는다. 앱이 공부 중 BACKGROUND를 보고하면 서버 시각 5분 뒤 확인 알림을 예약한다. 같은 eventId와 동일 입력의 재전송은 200이며, 새로운 BACKGROUND를 반복 보고해도 첫 이탈 시각은 유지된다. FOREGROUND 복귀 또는 공부 일시 정지·종료는 대기 중 알림을 취소한다. HTTP 409 코드는 동일 eventId에 다른 입력을 사용한 PRESENCE_EVENT_REUSED, 이전 이하의 sequence를 보낸 PRESENCE_SEQUENCE_CONFLICT, 공부가 STUDYING이 아닌 상태에서 BACKGROUND를 보낸 STUDY_NOT_RUNNING이다. 서버는 앱 강제 종료를 항상 감지할 수 없으므로 클라이언트가 앱 상태 전환을 보고해야 한다. deliveryEnabled=false에서는 PENDING이어도 원격 푸시는 발송하지 않는다. 원격 푸시 전송은 서버 설정으로 별도 활성화해야 한다.",
         "parameters": [
           {
             "name": "sessionId",

@@ -231,6 +231,47 @@ class ChatServiceTest {
     }
 
     @Test
+    void repeatedStorageFailureRetainsReplyOnlyForOriginalRequestAndOwner() {
+        stubOwner();
+        UUID other = UUID.randomUUID();
+        doReturn(List.of(other)).when(jdbc).query(
+                eq("SELECT id FROM users WHERE id = ?"), any(RowMapper.class), eq(other.toString()));
+        var calls = new AtomicInteger();
+        when(available.getIfAvailable()).thenReturn((content, previous, assistant, keys) -> {
+            calls.incrementAndGet();
+            return new ChatProvider.Reply(List.of(new ChatProvider.Utterance("JOY", "Hello")));
+        });
+        ChatMemoryService memory = mock(ChatMemoryService.class);
+        var outage = new java.util.concurrent.atomic.AtomicBoolean(true);
+        when(memory.save(eq(userId), any(ChatDto.Request.class), any(ChatDto.Exchange.class), any(String.class)))
+                .thenAnswer(inv -> {
+                    if (outage.get()) throw new DataAccessResourceFailureException("unavailable");
+                    return new ChatMemoryService.Saved(inv.getArgument(1), inv.getArgument(2), inv.getArgument(3));
+                });
+        ChatService service = new ChatService(jdbc, Clock.systemUTC(), available, null, memory, null, 30);
+        var request = new ChatDto.Request(UUID.randomUUID(), "hello", null, null, List.of("JOY"));
+        var initial = service.create(userId, request);
+        assertEquals("CHAT_MEMORY_WRITE_FAILED", initial.failureCode());
+        assertTrue(initial.utterances().isEmpty());
+        var linked = new ChatDto.Request(UUID.randomUUID(), "이어 말할게", null,
+                request.clientRequestId(), List.of("JOY"));
+        assertEquals("INVALID_PREVIOUS_EXCHANGE",
+                assertThrows(ApiException.class, () -> service.create(userId, linked)).code());
+        assertEquals(1, calls.get());
+        assertTrue(service.recover(other, request.clientRequestId()).items().isEmpty());
+        assertEquals("CLIENT_REQUEST_ID_REUSED", assertThrows(ApiException.class, () -> service.create(userId,
+                new ChatDto.Request(request.clientRequestId(), "changed", null, null, List.of("JOY")))).code());
+        assertEquals("CHAT_MEMORY_WRITE_FAILED", service.create(userId, request).failureCode());
+        outage.set(false);
+        var recovered = service.recover(userId, request.clientRequestId()).items().getFirst();
+        assertEquals(initial.id(), recovered.id());
+        assertEquals("SUCCEEDED", recovered.status());
+        assertEquals("Hello", recovered.utterances().getFirst().content());
+        assertEquals(recovered, service.create(userId, request));
+        assertEquals(1, calls.get());
+    }
+
+    @Test
     void missingProviderDoesNotConsumeRequestIdAndAbsentRecoveryIsEmpty() {
         stubOwner();
         ChatService service = new ChatService(jdbc, Clock.systemUTC(), available, 30);

@@ -12,6 +12,7 @@ import java.util.UUID;
 import java.util.regex.Pattern;
 import kr.ganzithon.backend.common.ApiException;
 import kr.ganzithon.backend.common.PortableJdbc;
+import kr.ganzithon.backend.identity.IdentityService;
 import org.springframework.dao.DuplicateKeyException;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.jdbc.core.JdbcTemplate;
@@ -23,12 +24,14 @@ public class StudyAwayService {
     private static final Pattern EXPO_TOKEN = Pattern.compile("(?:Expo|Exponent)PushToken\\[[A-Za-z0-9_-]{8,200}\\]");
     private final PortableJdbc jdbc;
     private final Clock clock;
+    private final IdentityService identities;
     private final boolean deliveryEnabled;
 
-    public StudyAwayService(JdbcTemplate jdbc, Clock clock,
+    public StudyAwayService(JdbcTemplate jdbc, Clock clock, IdentityService identities,
                             @Value("${ganzi.push.enabled:false}") boolean deliveryEnabled) {
         this.jdbc = new PortableJdbc(jdbc);
         this.clock = clock;
+        this.identities = identities;
         this.deliveryEnabled = deliveryEnabled;
     }
 
@@ -42,67 +45,96 @@ public class StudyAwayService {
                             long sequence, String state, OffsetDateTime awayAt,
                             OffsetDateTime dueAt, String deliveryStatus) { }
 
+    private record Device(UUID installationId, UUID userId, UUID authSessionId, String tokenHash) { }
+
     @Transactional
-    public DeviceResult register(UUID userId, UUID installationId, String token) {
+    public DeviceResult register(UUID userId, String authToken, UUID installationId, String token) {
         if (token == null || !EXPO_TOKEN.matcher(token).matches()) {
             throw invalid("expoPushToken must be an Expo push token");
         }
         lockUser(userId);
-        List<UUID> owners = jdbc.queryForList(
-                "SELECT user_id FROM push_devices WHERE installation_id = ?", UUID.class, installationId);
-        if (!owners.isEmpty() && !owners.getFirst().equals(userId)) {
+        UUID authSessionId = identities.requireCurrentSession(userId, authToken);
+        String hash = hash(token);
+        Device installation = findDevice("installation_id", installationId);
+        if (installation != null && !installation.userId().equals(userId)) {
             throw new ApiException(409, "PUSH_DEVICE_OWNERSHIP_CONFLICT", "Installation belongs to another user");
         }
-        String hash = hash(token);
-        List<UUID> tokenOwners = jdbc.queryForList(
-                "SELECT user_id FROM push_devices WHERE token_hash = ?", UUID.class, hash);
-        if (!tokenOwners.isEmpty() && !tokenOwners.getFirst().equals(userId)) {
+        Device tokenDevice = findDevice("token_hash", hash);
+        if (tokenDevice != null && !tokenDevice.userId().equals(userId)) {
             throw new ApiException(409, "PUSH_TOKEN_OWNERSHIP_CONFLICT", "Push token belongs to another user");
         }
-        List<UUID> tokenInstallations = jdbc.queryForList(
-                "SELECT installation_id FROM push_devices WHERE token_hash = ?", UUID.class, hash);
-        if (!tokenInstallations.isEmpty() && !tokenInstallations.getFirst().equals(installationId)) {
-            // Reinstallation can change the local installation UUID without rotating the Expo token.
-            // The owner row lock serializes this move with the owner's presence and study writes.
-            // Deleting the old device also removes its pending presence/outbox by FK cascade.
-            jdbc.update("DELETE FROM push_devices WHERE installation_id = ? AND user_id = ?",
-                    tokenInstallations.getFirst(), userId);
+        boolean bindExisting = installation != null && !authSessionId.equals(installation.authSessionId());
+        if (bindExisting && (!hash.equals(installation.tokenHash()) || hasActiveSession(installation))) {
+            throw sessionConflict();
         }
-        OffsetDateTime now = now();
+
         try {
-            if (owners.isEmpty()) {
-                jdbc.update("INSERT INTO push_devices (installation_id,user_id,expo_push_token,token_hash,created_at,updated_at) "
-                        + "VALUES (?,?,?,?,?,?)", installationId, userId, token, hash, now, now);
-            } else {
-                jdbc.update("UPDATE push_devices SET expo_push_token = ?,token_hash = ?,updated_at = ? "
-                        + "WHERE installation_id = ? AND user_id = ?", token, hash, now, installationId, userId);
+            if (tokenDevice != null && !tokenDevice.installationId().equals(installationId)) {
+                if (!authSessionId.equals(tokenDevice.authSessionId())) throw sessionConflict();
+                // Reinstallation with the same session and token clears the prior installation's presence.
+                jdbc.update("DELETE FROM push_devices WHERE installation_id=? AND user_id=? AND auth_session_id=?",
+                        tokenDevice.installationId(), userId, authSessionId);
             }
+            OffsetDateTime now = now();
+            if (installation == null) {
+                jdbc.update("INSERT INTO push_devices (installation_id,user_id,expo_push_token,token_hash,"
+                        + "auth_session_id,created_at,updated_at) VALUES (?,?,?,?,?,?,?)",
+                        installationId, userId, token, hash, authSessionId, now, now);
+            } else {
+                if (bindExisting) {
+                    // Presence from an earlier or unbound registration must not resume under this session.
+                    jdbc.update("DELETE FROM study_app_presence WHERE installation_id=? AND user_id=?",
+                            installationId, userId);
+                }
+                jdbc.update("UPDATE push_devices SET expo_push_token=?,token_hash=?,auth_session_id=?,updated_at=? "
+                        + "WHERE installation_id=? AND user_id=?", token, hash, authSessionId, now, installationId, userId);
+            }
+            return new DeviceResult(installationId, now);
         } catch (DuplicateKeyException ex) {
-            // Concurrent registration by another owner may have passed the precheck.
-            throw new ApiException(409, "PUSH_DEVICE_CONFLICT", "Device or push token is already registered");
+            throw new ApiException(409, "PUSH_DEVICE_CONFLICT", "Installation, session or push token is already registered");
         }
-        return new DeviceResult(installationId, now);
+    }
+
+    private Device findDevice(String column, Object value) {
+        var devices = jdbc.query("SELECT installation_id,user_id,auth_session_id,token_hash FROM push_devices WHERE "
+                        + column + "=?", (rs, row) -> new Device(PortableJdbc.uuid(rs,1),PortableJdbc.uuid(rs,2),
+                        PortableJdbc.uuid(rs,3),rs.getString(4)), value);
+        return devices.isEmpty() ? null : devices.getFirst();
+    }
+
+    private boolean hasActiveSession(Device device) {
+        return device.authSessionId() != null && !jdbc.queryForList(
+                "SELECT id FROM auth_sessions WHERE id=? AND user_id=? AND expires_at>? AND revoked_at IS NULL",
+                UUID.class, device.authSessionId(), device.userId(), now()).isEmpty();
+    }
+
+    private ApiException sessionConflict() {
+        return new ApiException(409, "PUSH_DEVICE_SESSION_CONFLICT", "Push registration does not match this session");
     }
 
     @Transactional
-    public void remove(UUID userId, UUID installationId) {
+    public void remove(UUID userId, String authToken, UUID installationId) {
         lockUser(userId);
-        jdbc.update("DELETE FROM push_devices WHERE installation_id = ? AND user_id = ?", installationId, userId);
+        UUID authSessionId = identities.requireCurrentSession(userId, authToken);
+        jdbc.update("DELETE FROM push_devices WHERE installation_id=? AND user_id=? AND auth_session_id=?",
+                installationId, userId, authSessionId);
     }
 
     @Transactional
-    public PresenceResult record(UUID userId, UUID sessionId, UUID installationId,
+    public PresenceResult record(UUID userId, String authToken, UUID sessionId, UUID installationId,
                                  UUID eventId, long sequence, String state) {
         if (sequence < 0 || sequence == Long.MAX_VALUE || !List.of("FOREGROUND", "BACKGROUND").contains(state)) {
             throw invalid("Invalid presence event");
         }
         lockUser(userId);
+        UUID authSessionId = identities.requireCurrentSession(userId, authToken);
         List<String> statuses = jdbc.queryForList(
                 "SELECT status FROM study_sessions WHERE id = ? AND user_id = ?", String.class, sessionId, userId);
         if (statuses.isEmpty()) throw new ApiException(404, "RESOURCE_NOT_FOUND", "Study session not found");
         List<UUID> devices = jdbc.queryForList(
-                "SELECT installation_id FROM push_devices WHERE installation_id = ? AND user_id = ?",
-                UUID.class, installationId, userId);
+                "SELECT installation_id FROM push_devices WHERE installation_id=? AND user_id=? "
+                + "AND auth_session_id=?",
+                UUID.class, installationId, userId, authSessionId);
         if (devices.isEmpty()) throw new ApiException(404, "RESOURCE_NOT_FOUND", "Push device not found");
         OffsetDateTime now = now();
         List<Presence> existing = find(userId, sessionId, installationId);

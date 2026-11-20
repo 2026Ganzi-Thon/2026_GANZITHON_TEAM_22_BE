@@ -12,6 +12,8 @@ public record StudySessionDto(
         OffsetDateTime endedAt,
         String endReason,
         long studySeconds,
+        long priorTaskStudySeconds,
+        Long totalTaskStudySeconds,
         OffsetDateTime runningStartedAt,
         UUID startRequestId,
         OffsetDateTime serverTime

@@ -21,21 +21,24 @@ public class StudyAwayController {
 
     @PutMapping("/push-devices/{installationId}")
     public StudyAwayService.DeviceResult register(@RequestAttribute("userId") UUID userId,
+                                                   @RequestAttribute("accessToken") String authToken,
                                                    @PathVariable UUID installationId,
                                                    @RequestBody JsonNode body) {
         requireFields(body, Set.of("expoPushToken"));
-        return service.register(userId, installationId, text(body,"expoPushToken"));
+        return service.register(userId, authToken, installationId, text(body,"expoPushToken"));
     }
 
     @DeleteMapping("/push-devices/{installationId}")
     public ResponseEntity<Void> remove(@RequestAttribute("userId") UUID userId,
+                                       @RequestAttribute("accessToken") String authToken,
                                        @PathVariable UUID installationId) {
-        service.remove(userId, installationId);
+        service.remove(userId, authToken, installationId);
         return ResponseEntity.noContent().build();
     }
 
     @PutMapping("/study-sessions/{sessionId}/presence")
     public StudyAwayService.PresenceResult presence(@RequestAttribute("userId") UUID userId,
+                                                    @RequestAttribute("accessToken") String authToken,
                                                     @PathVariable UUID sessionId,
                                                     @RequestBody JsonNode body) {
         requireFields(body, Set.of("installationId","eventId","sequence","state"));
@@ -43,7 +46,7 @@ public class StudyAwayController {
         if (seq == null || !seq.isIntegralNumber() || !seq.canConvertToLong() || seq.longValue() < 0) {
             throw badRequest("sequence must be a nonnegative integer");
         }
-        return service.record(userId, sessionId, uuid(body,"installationId"),
+        return service.record(userId, authToken, sessionId, uuid(body,"installationId"),
                 uuid(body,"eventId"), seq.longValue(), text(body,"state"));
     }
 
