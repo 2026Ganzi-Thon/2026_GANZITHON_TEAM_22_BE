@@ -1,0 +1,6 @@
+# Use the existing backend image to retain its Java runtime, user and entrypoint.
+ARG RUNTIME_IMAGE=haeboyang-backend:qa-runtime-base
+FROM ${RUNTIME_IMAGE}
+ARG APP_REVISION
+LABEL org.opencontainers.image.revision="${APP_REVISION}"
+COPY --chmod=0644 app.jar /app/app.jar
