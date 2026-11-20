@@ -3,6 +3,7 @@ package kr.ganzithon.backend.chat;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import java.net.ConnectException;
 import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
@@ -41,6 +42,7 @@ public final class OpenAiChatProvider implements ChatProvider {
     private static final String TRANSCRIPT_GUIDE = "sessionTranscript는 같은 대화에서 실제로 오간 앞선 턴이다. 배열 순서대로 읽고 현재 질문의 지시어나 생략된 대상을 연결해라. 사용자가 직접 밝힌 사실·수정과 친구가 제안한 행동을 구분하고, 사용자가 확인한 행동만 완료됐다고 보아라. 누가 한 말인지 인용할 때는 발화자 이름을 지켜라. 새로 합류한 친구도 앞선 대화를 참고하되, 다른 친구의 말을 자신이 했다고 하지 마라. 여러 친구에게 물었으면 각자 같은 맥락에서 현재 질문에 답하고, 이어지는 발언에서는 이미 나온 설명을 반복하지 마라.";
     private static final Set<String> SUPPORTED_MODELS = Set.of(SOL, SOL_62, "gpt-6-luna", "gpt-6.1-terra");
     private static final Set<String> THINKING_EFFORTS = Set.of("low", "medium", "high", "xhigh", "max");
+    private static final long INPUT_TOKEN_MARGIN = 4096L;
     private static final int MAX_REQUEST_BYTES = 65_536;
     private static final int MAX_TRANSCRIPT_REQUEST_BYTES = 131_072;
     private final ObjectMapper mapper;
@@ -56,9 +58,14 @@ public final class OpenAiChatProvider implements ChatProvider {
     public OpenAiChatProvider(ObjectMapper mapper,
                               @Value("${ganzi.openai.api-key:}") String apiKey,
                               @Value("${ganzi.openai.model:gpt-6.2-sol}") String model,
-                              @Value("${ganzi.openai.timeout-seconds:20}") int timeoutSeconds,
-                              @Value("${ganzi.openai.max-output-tokens:2048}") int maxOutputTokens,
+                              @Value("${ganzi.openai.timeout-seconds:20}") String timeoutSeconds,
+                              @Value("${ganzi.openai.max-output-tokens:2048}") String maxOutputTokens,
                               @Value("${ganzi.openai.reasoning-effort:}") String reasoningEffort) {
+        this(mapper, apiKey, model, parseSetting(timeoutSeconds), parseSetting(maxOutputTokens), reasoningEffort);
+    }
+
+    public OpenAiChatProvider(ObjectMapper mapper, String apiKey, String model, int timeoutSeconds,
+                              int maxOutputTokens, String reasoningEffort) {
         this(mapper, apiKey, model, timeoutSeconds, maxOutputTokens, reasoningEffort, RESPONSES_URI,
             HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(5))
                 .followRedirects(HttpClient.Redirect.NEVER).build());
@@ -84,15 +91,34 @@ public final class OpenAiChatProvider implements ChatProvider {
         this.client = client;
     }
 
+    private static int parseSetting(String value) {
+        try {
+            return Integer.parseInt(value.trim());
+        } catch (NumberFormatException invalid) {
+            return -1;
+        }
+    }
+
+    String configurationIssue() {
+        if (apiKey == null || apiKey.isBlank()) return "OPENAI_API_KEY_MISSING";
+        if (model == null || !SUPPORTED_MODELS.contains(model)) return "OPENAI_MODEL_UNSUPPORTED";
+        if (timeoutSeconds < 1 || timeoutSeconds > 30) return "OPENAI_TIMEOUT_INVALID";
+        if (maxOutputTokens < 128 || maxOutputTokens > 2048) return "OPENAI_OUTPUT_LIMIT_INVALID";
+        if (THINKING_EFFORTS.contains(reasoningEffort)) return null;
+        if (!SOL.equals(model) && !SOL_62.equals(model) && "none".equals(reasoningEffort)) return null;
+        return "OPENAI_REASONING_EFFORT_INVALID";
+    }
+
     @Override
     public void ensureConfigured() {
-        if (apiKey == null || apiKey.isBlank() || !SUPPORTED_MODELS.contains(model)
-            || timeoutSeconds < 1 || timeoutSeconds > 30
-            || maxOutputTokens < 128 || maxOutputTokens > 2048
-            || !(THINKING_EFFORTS.contains(reasoningEffort)
-                || (!SOL.equals(model) && !SOL_62.equals(model) && "none".equals(reasoningEffort)))) {
-            throw new ApiException(503, "CHAT_NOT_CONFIGURED", "대화 서비스 설정이 완료되지 않았습니다.");
+        if (configurationIssue() != null) {
+            throw new ApiException(503, "CHAT_NOT_CONFIGURED", "대화 서비스 설정이 완료되지 않았습니다.", false);
         }
+    }
+
+    @Override
+    public CostQuote minimumReservationQuote() {
+        return new CostQuote(model, INPUT_TOKEN_MARGIN, maxOutputTokens);
     }
 
     @Override
@@ -126,7 +152,7 @@ public final class OpenAiChatProvider implements ChatProvider {
         byte[] body = payload(turn);
         // UTF-8 request bytes plus fixed margin conservatively bound token count, including schema.
         // The same payload builder is used by generate; no cache discount is assumed.
-        return new CostQuote(model, (long) body.length + 4096L, maxOutputTokens);
+        return new CostQuote(model, body.length + INPUT_TOKEN_MARGIN, maxOutputTokens);
     }
 
     @Override
@@ -173,7 +199,8 @@ public final class OpenAiChatProvider implements ChatProvider {
             Thread.currentThread().interrupt();
             throw failure("AI_PROVIDER_FAILED", true, null);
         } catch (ExecutionException ex) {
-            throw failure("AI_PROVIDER_FAILED", true, null);
+            // A connect failure precedes HTTP transmission. Other I/O failures can follow a sent POST.
+            throw failure("AI_PROVIDER_FAILED", !(ex.getCause() instanceof ConnectException), null);
         }
     }
 

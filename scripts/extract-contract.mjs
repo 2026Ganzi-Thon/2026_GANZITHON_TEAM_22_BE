@@ -25,6 +25,17 @@ for (const [path, methods] of Object.entries(api.paths)) {
     }
     if (id === 'A06') copy.description = '본인 할 일과 위치순 세부 항목을 조회한다. summary는 실제 세부 항목을 집계하며, 항목이 없으면 ratio는 null이다.';
     if (id === 'A08') copy.description = '본인 할 일 삭제. 미종료 공부가 연결돼 있으면 409, 종료 기록의 연결은 해제하고 세부 항목은 연쇄 삭제한다. AI 관련 보호는 AI 구현 시 추가한다.';
+    if (id === 'A12') {
+      const example = copy.responses['201'].content['application/json'].example;
+      example.priorTaskStudySeconds = 0;
+      example.totalTaskStudySeconds = example.taskId == null ? null : example.studySeconds;
+    }
+    if (id === 'A04' || id === 'A07') {
+      for (const response of Object.values(copy.responses)) {
+        const example = response.content?.['application/json']?.example;
+        if (example?.id) example.version = id === 'A04' ? 0 : 1;
+      }
+    }
     (paths[path] ??= {})[method] = copy;
     copy.tags?.forEach(tag => tags.add(tag));
     count++;
@@ -58,13 +69,13 @@ paths['/api/v1/auth/login'] = { post: {
 } };
 paths['/api/v1/auth/logout'] = { post: {
   operationId: 'AUTH03_logout', tags: ['identity'], summary: '현재 세션 로그아웃',
-  description: 'Bearer로 지정된 현재 인증 세션만 폐기한다. 요청 본문은 허용하지 않는다. 다른 기기의 세션과 사용자 데이터는 유지한다.',
-  responses: { '204': { description: '현재 세션 폐기. 응답 본문 없음.' },
+  description: '요청 본문 없이 현재 Bearer로 호출한다. 현재 인증 세션과 그 세션에 연결된 푸시 설치 및 해당 설치의 앱 상태·대기 알림을 함께 해제한다. 다른 인증 세션·푸시 설치와 사용자 데이터는 유지한다.',
+  responses: { '204': { description: '현재 세션 폐기 및 연결된 설치 해제. 응답 본문 없음.' },
     ...commonErrors }
 } };
 paths['/api/v1/auth/password'] = { post: {
   operationId: 'AUTH04_changePassword', tags: ['identity'], summary: '이메일 계정 비밀번호 변경',
-  description: '현재 Bearer와 기존 비밀번호를 확인한다. 성공하면 해당 사용자에게 발급된 모든 이전 인증 세션을 폐기하고 새 토큰을 발급한다. 게스트 계정이나 틀린 기존 비밀번호는 401 INVALID_CREDENTIALS다.',
+  description: '현재 Bearer와 기존 비밀번호를 확인한다. 성공하면 이전 인증 토큰을 모두 폐기하고 새 토큰을 발급한다. 현재 세션에 연결된 푸시 설치는 새 토큰에 연결된다. 폐기되는 다른 세션에 연결된 푸시 설치와 앱 상태·대기 알림은 해제한다. 게스트 계정이나 틀린 기존 비밀번호는 401 INVALID_CREDENTIALS다.',
   requestBody: jsonRequest('PasswordChangeRequest'),
   responses: { '200': jsonResponse('비밀번호 변경과 새 불투명 인증 토큰 발급', 'AuthSessionDTO'),
     ...commonErrors }
@@ -75,6 +86,47 @@ const uuid = { type: 'string', format: 'uuid' };
 const dateTime = { type: 'string', format: 'date-time' };
 const json = schema => ({ content: { 'application/json': { schema } } });
 const clonedBaselineOperation = (path, method) => structuredClone(api.paths[path][method]);
+
+// Creation retries are opt-in so older clients retain the original 201 behavior.
+for (const [path, method, name] of [
+  ['/api/v1/tasks', 'post', 'TaskCreateRequest'],
+  ['/api/v1/tasks/{taskId}/subtasks', 'post', 'SubtaskCreateRequest']
+]) {
+  const operation = paths[path][method];
+  api.components.schemas[name].properties.clientRequestId = {
+    ...uuid, description: '선택. 같은 사용자가 같은 경로와 정규화된 입력으로 재시도할 때 동일 생성 결과를 찾는 UUID.'
+  };
+  operation.description = `${operation.description || ''} clientRequestId를 생략하면 매 요청마다 새 항목을 만들고 201을 반환한다. 제공하면 최초 생성은 201, 같은 요청의 재시도는 현재 항목과 200을 반환한다. 같은 ID로 다른 입력이나 부모를 요청하면 409 CLIENT_REQUEST_ID_REUSED, 생성 결과가 삭제됐다면 409 CREATE_RESULT_DELETED를 반환한다.`.trim();
+  operation.responses['200'] = structuredClone(operation.responses['201']);
+  operation.responses['200'].description = '같은 clientRequestId의 생성 결과 재조회';
+  operation.responses['409'] = errorRef('409');
+}
+
+for (const name of ['TaskDTO', 'TaskDetailDTO']) {
+  api.components.schemas[name].properties.version = {
+    type: 'integer', format: 'int32', minimum: 0,
+    description: '할 일 자체의 편집 버전. 기존 행은 0부터 시작한다. 세부 할 일 편집은 포함하지 않는다.'
+  };
+  api.components.schemas[name].required.push('version');
+}
+api.components.schemas.TaskPatchRequest.properties.expectedVersion = {
+  type: 'integer', format: 'int32', minimum: 0,
+  description: '선택. 조회한 할 일의 version. 다른 편집이 먼저 저장됐다면 409 TASK_VERSION_CONFLICT.'
+};
+api.components.schemas.TaskPatchRequest.anyOf = ['title', 'description', 'dueDate', 'status']
+  .map(field => ({ required: [field] }));
+paths['/api/v1/tasks/{taskId}'].patch.description = '제공한 할 일 필드만 변경한다. expectedVersion을 주면 현재 버전과 비교해 경쟁 편집을 막는다. 실제 변경이 없으면 version과 updatedAt을 유지하며, expectedVersion만 보낸 요청은 400이다. 같은 expectedVersion의 수정 요청을 성공 후 재시도하면 버전 충돌 409가 정상이다. 세부 할 일 편집에는 이 버전이 적용되지 않는다.';
+
+const studyDto = api.components.schemas.StudyDTO;
+studyDto.properties.studySeconds.description = '응답이 가리키는 세션의 공부 시간(초). 휴식 시간과 이전 세션은 제외한다.';
+studyDto.properties.priorTaskStudySeconds = { type: 'integer', format: 'int64', minimum: 0,
+  description: '이 세션 시작 시각까지 종료된 본인의 같은 할 일 세션들의 합계(초). 이번 세션을 제외하고, 합산한 밀리초를 초로 내림한다. taskId=null이면 0이다. 이어 재는 화면은 이 값과 이번 세션의 표시 시간을 더한다.' };
+studyDto.required.push('priorTaskStudySeconds');
+studyDto.properties.totalTaskStudySeconds = {
+  anyOf: [{ type: 'integer', format: 'int64', minimum: 0 }, { type: 'null' }],
+  description: '같은 할 일의 종료 세션과 현재 세션의 밀리초를 먼저 합산한 뒤 한 번만 초로 내린 누적 공부 시간. taskId=null이면 null. 할 일 화면의 누적 시간에는 이 필드를 사용한다.'
+};
+studyDto.required.push('totalTaskStudySeconds');
 
 // A22: read-only entry context. The task is a suggestion, never an implicit study start.
 api.components.schemas.SuggestedTaskDTO = { type: 'object', additionalProperties: false,
@@ -129,7 +181,9 @@ paths['/api/v1/chat/exchanges'] = {
     requestBody: jsonRequest('ExchangeCreateRequest'),
     responses: { '200': jsonResponse('대화 생성 또는 이전 요청 결과', 'ExchangeDTO'),
       '400': errorRef('400'), '401': errorRef('401'), '404': errorRef('404'),
-      '409': errorRef('409'), '429': errorRef('429'), '500': errorRef('500'), '503': errorRef('503') } },
+      '409': errorRef('409'), '422': jsonResponse('팀 QA 설정을 켠 경우의 CHAT_SAFETY_SUPPORT. 기존 한국어 안내를 message에 반환하며 retryable은 false다. 모델 호출·요금 예약·새 대화 저장이 없다.', 'ErrorDTO'),
+      '429': errorRef('429'), '500': errorRef('500'),
+      '503': jsonResponse('CHAT_NOT_CONFIGURED는 서버 설정을 완료해야 하며 retryable=false다. 이때 앱은 대기를 끝낸다. 일시적인 저장·승인 오류는 해당 오류 코드와 retryable을 확인한다.', 'ErrorDTO') } },
   get: { operationId: 'A17_recoverExchange', tags: ['chat'], summary: '요청 ID로 대화 결과 복구',
     description: '본인 요청 한 건을 찾는다. 저장된 성공·실패 결과는 서버 재시작과 gzip 압축 뒤에도 복구한다. 이 서버가 결과를 처리 중이면 저장 트랜잭션이 완료될 때까지 items에 PROCESSING이 들어갈 수 있다. 이 서버에 진행 정보가 없고 완료 결과가 저장되지 않았다면 items=[]다. 저장된 결과의 손상이 확인되면 503 CHAT_HISTORY_UNAVAILABLE과 retryable=false를 반환한다. 일시적인 저장소 읽기 실패는 같은 코드와 retryable=true를 반환한다.',
     parameters: [{ name: 'clientRequestId', in: 'query', required: true, schema: uuid }],
@@ -174,7 +228,7 @@ api.components.schemas.ChatUsageDTO = { type: 'object', additionalProperties: fa
   properties: { timeZone: { type: 'string', const: 'UTC' },
     daily: schemaRef('ChatPeriodUsageDTO'), monthly: schemaRef('ChatPeriodUsageDTO'),
     dailyRequestLimit: { type: 'integer', minimum: 1 },
-    availability: { type: 'string', enum: ['AVAILABLE', 'AI_BUDGET_EXCEEDED',
+    availability: { type: 'string', description: 'AVAILABLE은 조회 시점에 확인된 차단 사유가 없다는 뜻이다. 실제 요청의 문맥·예약액과 동시 사용량에 따라 접수가 거절될 수 있다. 제공자가 없거나 설정이 유효하지 않으면 CHAT_NOT_CONFIGURED, 일·월 잔여 예산이 확실한 예약 하한보다 작으면 AI_BUDGET_EXCEEDED다.', enum: ['AVAILABLE', 'CHAT_NOT_CONFIGURED', 'AI_BUDGET_EXCEEDED',
       'AI_DAILY_USAGE_EXCEEDED', 'AI_CREDIT_EXHAUSTED', 'AI_UPSTREAM_QUOTA_EXCEEDED',
       'AI_USAGE_EXCEEDED_RESERVATION'] } },
   required: ['timeZone', 'daily', 'monthly', 'dailyRequestLimit', 'availability'] };
@@ -197,7 +251,7 @@ api.components.schemas.ReminderDTO = { type: 'object', additionalProperties: fal
   description: '서버가 저장한 예약 의도다. 단말 OS 알림 전송 성공을 뜻하지 않는다.' };
 const reminderPutPath = '/api/v1/study-sessions/{sessionId}/next-start-reminder';
 paths[reminderPutPath] = { put: clonedBaselineOperation(reminderPutPath, 'put') };
-paths[reminderPutPath].put.description = '새 예약은 본인의 가장 최근 ENDED 공부에서 7일 이내 미래 시각으로 지정한다. 같은 입력을 다시 보내면 200으로 저장된 상태를 반환하며 CANCELED 또는 EXPIRED 상태도 그대로 반환한다. 앱은 반환된 상태가 ACTIVE일 때만 단말 OS 알림을 예약한다. 소유 계정이 이미 삭제되었으면 401 AUTH_REQUIRED다. HTTP 409는 REMINDER_REQUEST_CONFLICT, ACTIVE_REMINDER_EXISTS, REMINDER_SOURCE_AMBIGUOUS, REMINDER_SOURCE_NOT_LATEST, STUDY_NOT_ENDED 등 업무 조건 충돌이다. 잠금 경합으로 예약을 완료하지 못하면 503 REMINDER_TEMPORARILY_UNAVAILABLE과 retryable=true를 반환한다. 앱은 같은 경로와 본문으로 다시 요청할 수 있다.';
+paths[reminderPutPath].put.description = '새 예약은 본인의 가장 최근 공부가 ENDED일 때 그 세션에서 7일 이내 미래 시각으로 지정한다. 같은 세션의 저장된 시각과 시간대를 PUT으로 보내면 200으로 기존 상태를 반환하며 CANCELED 또는 EXPIRED도 그대로 반환한다. 다른 값으로 PUT하면 409 REMINDER_REQUEST_CONFLICT다. ACTIVE 상태의 시각과 시간대를 바꾸려면 PATCH /api/v1/start-reminders/{reminderId}를 사용한다. CANCELED 또는 EXPIRED 예약은 이 세션에서 다시 활성화할 수 없다. 앱은 반환된 상태가 ACTIVE일 때만 단말 OS 알림을 예약한다. 소유 계정이 이미 삭제되었으면 401 AUTH_REQUIRED다. HTTP 409에는 ACTIVE_REMINDER_EXISTS, REMINDER_SOURCE_AMBIGUOUS, REMINDER_SOURCE_NOT_LATEST, STUDY_NOT_ENDED도 포함된다. 잠금 경합으로 예약을 완료하지 못하면 503 REMINDER_TEMPORARILY_UNAVAILABLE과 retryable=true를 반환한다. 앱은 같은 경로와 본문으로 다시 요청할 수 있다.';
 paths[reminderPutPath].put.responses['201'] = jsonResponse('새 알림 의도 저장', 'ReminderCurrentDTO');
 paths[reminderPutPath].put.responses['200'] = jsonResponse('동일 요청의 저장 상태 재조회', 'ReminderCurrentDTO');
 paths[reminderPutPath].put.responses['503'] = jsonResponse(
@@ -267,21 +321,21 @@ api.components.schemas.StudyPresenceDTO = { type: 'object', additionalProperties
   required: ['sessionId', 'installationId', 'state', 'awayAt', 'dueAt', 'deliveryStatus', 'deliveryEnabled', 'serverTime'] };
 paths['/api/v1/push-devices/{installationId}'] = {
   put: { operationId: 'PUSH01_registerDevice', tags: ['reminders'], summary: '내 앱 설치의 Expo 푸시 토큰 등록 또는 갱신',
-    description: 'installationId는 앱 설치마다 생성·보관하는 UUID다. 같은 사용자·설치에서 등록을 반복하거나 토큰을 갱신할 수 있다. 앱 재설치 등으로 같은 사용자의 Expo 토큰을 새로운 installationId로 등록하면 이전 설치 기록과 그 설치의 대기 중 앱 상태·알림을 삭제한 뒤 새 설치로 옮긴다. HTTP 409 코드는 다른 사용자 소유 설치 ID의 PUSH_DEVICE_OWNERSHIP_CONFLICT, 다른 사용자 소유 토큰의 PUSH_TOKEN_OWNERSHIP_CONFLICT, 동시 등록 충돌의 PUSH_DEVICE_CONFLICT다. 서버의 원격 푸시 전송은 GANZI_PUSH_ENABLED=false가 기본이며, 이 응답은 실제 알림 수신을 보증하지 않는다.',
+    description: 'installationId는 앱 설치마다 생성·보관하는 UUID다. 현재 Bearer 세션에 설치 하나를 연결하며, 같은 세션과 설치에서 재등록하거나 토큰을 갱신할 수 있다. 같은 세션이 같은 Expo 토큰을 새 설치 UUID로 등록하면 기존 설치와 그 설치의 앱 상태·대기 알림을 삭제한다. 세션 연결이 없거나 연결된 인증이 만료된 설치는 소유 계정이 동일한 설치 UUID와 저장된 Expo 토큰으로 재등록해 연결할 수 있다. 새 세션에 연결하면 해당 설치의 이전 공부 이탈 상태가 정리된다. HTTP 409 코드는 다른 사용자 소유 설치의 PUSH_DEVICE_OWNERSHIP_CONFLICT, 다른 사용자 소유 토큰의 PUSH_TOKEN_OWNERSHIP_CONFLICT, 같은 계정 내 세션 불일치 또는 기존 설치 확인 실패의 PUSH_DEVICE_SESSION_CONFLICT, 세션의 다른 설치 등록 또는 동시 등록 충돌의 PUSH_DEVICE_CONFLICT다. 원격 푸시 전송은 GANZI_PUSH_ENABLED=false가 기본이다.',
     parameters: [{ name: 'installationId', in: 'path', required: true, schema: uuid }],
     requestBody: jsonRequest('PushDevicePutRequest'),
     responses: { '200': jsonResponse('등록 또는 갱신된 앱 설치', 'PushDeviceDTO'),
       '400': errorRef('400'), '401': errorRef('401'), '409': errorRef('409'),
       '429': errorRef('429'), '500': errorRef('500') } },
   delete: { operationId: 'PUSH02_removeDevice', tags: ['reminders'], summary: '내 앱 설치의 푸시 토큰 해제',
-    description: '본인 소유의 설치 기록만 삭제한다. 존재하지 않거나 다른 사용자 소유인 설치 ID에도 존재 여부를 숨기기 위해 204를 반환한다.',
+    description: '현재 Bearer 세션에 연결된 설치만 해제한다. 없는 설치 또는 현재 세션과 연결되지 않은 설치에도 204를 반환한다.',
     parameters: [{ name: 'installationId', in: 'path', required: true, schema: uuid }],
     responses: { '204': { description: '푸시 토큰 해제. 응답 본문 없음.' },
       '400': errorRef('400'), '401': errorRef('401'), '429': errorRef('429'), '500': errorRef('500') } }
 };
 paths['/api/v1/study-sessions/{sessionId}/presence'] = { put: {
   operationId: 'PUSH03_reportStudyPresence', tags: ['study', 'reminders'], summary: '공부 중 앱 전경·배경 상태 보고',
-  description: '앱이 공부 중 BACKGROUND를 보고하면 서버 시각 5분 뒤 확인 알림을 예약한다. 같은 eventId와 동일 입력의 재전송은 200이며, 새로운 BACKGROUND를 반복 보고해도 첫 이탈 시각은 유지된다. FOREGROUND 복귀 또는 공부 일시 정지·종료는 대기 중 알림을 취소한다. HTTP 409 코드는 동일 eventId에 다른 입력을 사용한 PRESENCE_EVENT_REUSED, 이전 이하의 sequence를 보낸 PRESENCE_SEQUENCE_CONFLICT, 공부가 STUDYING이 아닌 상태에서 BACKGROUND를 보낸 STUDY_NOT_RUNNING이다. 서버는 앱 강제 종료를 항상 감지할 수 없으므로 클라이언트가 앱 상태 전환을 보고해야 한다. deliveryEnabled=false에서는 PENDING이어도 원격 푸시는 발송하지 않는다. 원격 푸시 전송은 서버 설정으로 별도 활성화해야 한다.',
+  description: '현재 Bearer 세션에 연결된 설치에서만 앱 상태를 보고할 수 있다. 이전 버전에서 이관된 기기는 같은 계정으로 다시 등록한 뒤 상태를 보고한다. 재연결 전에는 해당 기기로 공부 이탈 푸시를 보내거나 그 기기의 전경 상태로 다른 기기의 알림을 막지 않는다. 앱이 공부 중 BACKGROUND를 보고하면 서버 시각 5분 뒤 확인 알림을 예약한다. 같은 eventId와 동일 입력의 재전송은 200이며, 새로운 BACKGROUND를 반복 보고해도 첫 이탈 시각은 유지된다. FOREGROUND 복귀 또는 공부 일시 정지·종료는 대기 중 알림을 취소한다. HTTP 409 코드는 동일 eventId에 다른 입력을 사용한 PRESENCE_EVENT_REUSED, 이전 이하의 sequence를 보낸 PRESENCE_SEQUENCE_CONFLICT, 공부가 STUDYING이 아닌 상태에서 BACKGROUND를 보낸 STUDY_NOT_RUNNING이다. 서버는 앱 강제 종료를 항상 감지할 수 없으므로 클라이언트가 앱 상태 전환을 보고해야 한다. deliveryEnabled=false에서는 PENDING이어도 원격 푸시는 발송하지 않는다. 원격 푸시 전송은 서버 설정으로 별도 활성화해야 한다.',
   parameters: [{ name: 'sessionId', in: 'path', required: true, schema: uuid }],
   requestBody: jsonRequest('StudyPresencePutRequest'),
   responses: { '200': jsonResponse('서버가 저장한 앱 상태와 알림 상태', 'StudyPresenceDTO'),

@@ -27,7 +27,8 @@ public class TaskController {
     @PostMapping
     public ResponseEntity<TaskDto> create(@RequestAttribute("userId") UUID userId,
                                           @RequestBody JsonNode body) {
-        return ResponseEntity.status(HttpStatus.CREATED).body(service.create(userId, body));
+        var result = service.createResult(userId, body);
+        return ResponseEntity.status(result.created() ? HttpStatus.CREATED : HttpStatus.OK).body(result.value());
     }
 
     @GetMapping

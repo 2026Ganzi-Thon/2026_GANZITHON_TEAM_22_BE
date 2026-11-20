@@ -17,23 +17,42 @@ import org.springframework.transaction.annotation.Transactional;
 
 @Service
 public class SubtaskService {
-    private static final Set<String> CREATE_FIELDS = Set.of("title");
+    private static final Set<String> CREATE_FIELDS = Set.of("title", "clientRequestId");
     private static final Set<String> PATCH_FIELDS = Set.of("title", "status");
     private final PortableJdbc jdbc;
     private final Clock clock;
     private final TaskService tasks;
+    private final TaskCreateRequests createRequests;
 
-    public SubtaskService(JdbcTemplate jdbc, Clock clock, TaskService tasks) {
+    public SubtaskService(JdbcTemplate jdbc, Clock clock, TaskService tasks,
+                          TaskCreateRequests createRequests) {
         this.jdbc = new PortableJdbc(jdbc);
         this.clock = clock;
         this.tasks = tasks;
+        this.createRequests = createRequests;
     }
 
     @Transactional
     public SubtaskDto create(UUID userId, UUID taskId, JsonNode body) {
+        return createResult(userId, taskId, body).value();
+    }
+
+    @Transactional
+    public TaskCreateRequests.Result<SubtaskDto> createResult(UUID userId, UUID taskId, JsonNode body) {
         TaskService.checkFields(body, CREATE_FIELDS, false);
         String title = TaskService.title(body.get("title"));
+        UUID requestId = TaskCreateRequests.requestId(body);
+        String hash = TaskCreateRequests.hash("SUBTASK", taskId, title);
         tasks.lockUser(userId);
+        UUID savedId = createRequests.prior(userId, requestId, "SUBTASK", taskId, hash);
+        if (savedId != null) {
+            try {
+                return new TaskCreateRequests.Result<>(findOwned(taskId, savedId), false);
+            } catch (ApiException ex) {
+                if (ex.status() == 404) throw TaskCreateRequests.deleted();
+                throw ex;
+            }
+        }
         tasks.findOwned(userId, taskId);
         Integer position = jdbc.queryForObject("""
                 SELECT COALESCE(MAX(position), 0) + 1 FROM subtasks WHERE task_id = ?
@@ -45,7 +64,8 @@ public class SubtaskService {
                                       completed_at, created_at, updated_at)
                 VALUES (?, ?, ?, 'TODO', ?, NULL, ?, ?)
                 """, id, taskId, title, position, now, now);
-        return findOwned(taskId, id);
+        createRequests.record(userId, requestId, "SUBTASK", taskId, id, hash, now);
+        return new TaskCreateRequests.Result<>(findOwned(taskId, id), true);
     }
 
     @Transactional

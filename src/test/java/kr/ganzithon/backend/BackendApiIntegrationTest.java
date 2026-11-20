@@ -279,6 +279,7 @@ class BackendApiIntegrationTest {
         assertEquals(sessionId, replay.path("id").asText());
         assertEquals("ENDED", replay.path("status").asText());
         assertTrue(replay.path("taskId").isNull());
+        assertEquals(0, replay.path("priorTaskStudySeconds").asLong(-1));
     }
 
     @Test void authValidationErrorsAndPrivateResponsesFollowCommonContract() throws Exception {
@@ -342,6 +343,103 @@ class BackendApiIntegrationTest {
         mvc.perform(delete(TASKS + "/" + first).header("Authorization", bearer(token)))
                 .andExpect(status().isNoContent());
         assertTrue(startContext(token).path("suggestedTask").isNull());
+    }
+
+    @Test void studyResponsesCarryPriorTimeForTheSameTaskAtSessionStart() throws Exception {
+        String token = guest();
+        String taskId = createTask(token, "Same task", null, null).path("id").asText();
+        String firstId = startStudy(token, taskId, UUID.randomUUID()).path("id").asText();
+        clock.advanceSeconds(10);
+        assertStudyTimes(action(token, firstId, "END", 0, null, 200), 0, 10);
+
+        UUID requestId = UUID.randomUUID();
+        JsonNode second = startStudy(token, taskId, requestId);
+        String secondId = second.path("id").asText();
+        assertStudyTimes(second, 10, 0);
+        clock.advanceSeconds(2);
+        JsonNode current = json(mvc.perform(get(STUDIES + "/current").header("Authorization", bearer(token)))
+                .andExpect(status().isOk()).andReturn()).path("studySession");
+        assertStudyTimes(current, 10, 2);
+        assertStudyTimes(startContext(token).path("currentSession"), 10, 2);
+        assertStudyTimes(action(token, secondId, "PAUSE", 0, null, 200), 10, 2);
+        clock.advanceSeconds(30);
+        assertStudyTimes(action(token, secondId, "RESUME", 1, null, 200), 10, 2);
+        assertStudyTimes(action(token, secondId, "END", 2, null, 200), 10, 2);
+        assertStudyTimes(action(token, secondId, "END", 2, null, 200), 10, 2);
+
+        String otherTaskId = createTask(token, "Other task", null, null).path("id").asText();
+        JsonNode otherTask = startStudy(token, otherTaskId, UUID.randomUUID());
+        assertStudyTimes(otherTask, 0, 0);
+        clock.advanceSeconds(5);
+        action(token, otherTask.path("id").asText(), "END", 0, null, 200);
+        JsonNode freeStudy = startStudy(token, null, UUID.randomUUID());
+        assertStudyTimes(freeStudy, 0, 0);
+        clock.advanceSeconds(7);
+        action(token, freeStudy.path("id").asText(), "END", 0, null, 200);
+        JsonNode secondFreeStudy = startStudy(token, null, UUID.randomUUID());
+        assertStudyTimes(secondFreeStudy, 0, 0);
+        action(token, secondFreeStudy.path("id").asText(), "END", 0, null, 200);
+
+        String otherToken = guest();
+        String sameTitleId = createTask(otherToken, "Same task", null, null).path("id").asText();
+        assertStudyTimes(startStudy(otherToken, sameTitleId, UUID.randomUUID()), 0, 0);
+        mvc.perform(get(STUDIES + "/" + secondId).header("Authorization", bearer(otherToken)))
+                .andExpect(status().isNotFound());
+
+        JsonNode third = startStudy(token, taskId, UUID.randomUUID());
+        assertStudyTimes(third, 12, 0);
+        clock.advanceSeconds(3);
+        assertStudyTimes(action(token, third.path("id").asText(), "END", 0, null, 200), 12, 3);
+
+        JsonNode historical = json(mvc.perform(get(STUDIES + "/" + secondId)
+                .header("Authorization", bearer(token))).andExpect(status().isOk()).andReturn());
+        assertStudyTimes(historical, 10, 2);
+        JsonNode replay = request(post(STUDIES), token,
+                "{\"clientRequestId\":\"" + requestId + "\",\"taskId\":\"" + taskId + "\"}", 200);
+        assertStudyTimes(replay, 10, 2);
+    }
+
+    @Test void totalTaskStudySecondsRetainsFractionsAcrossStudySessions() throws Exception {
+        String token = guest();
+        String taskId = createTask(token, "Short sessions", null, null).path("id").asText();
+        String firstId = startStudy(token, taskId, UUID.randomUUID()).path("id").asText();
+        clock.set(START.plusMillis(600));
+        JsonNode firstEnded = action(token, firstId, "END", 0, null, 200);
+        assertEquals(0, firstEnded.path("totalTaskStudySeconds").asLong(-1));
+
+        String secondId = startStudy(token, taskId, UUID.randomUUID()).path("id").asText();
+        clock.set(START.plusMillis(1200));
+        JsonNode second = json(mvc.perform(get(STUDIES + "/" + secondId)
+                .header("Authorization", bearer(token))).andExpect(status().isOk()).andReturn());
+        assertEquals(0, second.path("priorTaskStudySeconds").asLong(-1));
+        assertEquals(0, second.path("studySeconds").asLong(-1));
+        assertEquals(1, second.path("totalTaskStudySeconds").asLong(-1));
+
+        JsonNode paused = action(token, secondId, "PAUSE", 0, null, 200);
+        assertEquals(1, paused.path("totalTaskStudySeconds").asLong(-1));
+        clock.set(START.plusSeconds(20));
+        assertEquals(1, json(mvc.perform(get(STUDIES + "/" + secondId)
+                .header("Authorization", bearer(token))).andExpect(status().isOk()).andReturn())
+                .path("totalTaskStudySeconds").asLong(-1));
+        action(token, secondId, "END", 1, null, 200);
+
+        JsonNode free = startStudy(token, null, UUID.randomUUID());
+        assertTrue(free.path("totalTaskStudySeconds").isNull());
+        clock.set(START.plusSeconds(22));
+        JsonNode freeCurrent = json(mvc.perform(get(STUDIES + "/" + free.path("id").asText())
+                .header("Authorization", bearer(token))).andExpect(status().isOk()).andReturn());
+        assertEquals(2, freeCurrent.path("studySeconds").asLong(-1));
+        assertTrue(freeCurrent.path("totalTaskStudySeconds").isNull());
+    }
+
+    private static void assertStudyTimes(JsonNode study, long prior, long session) {
+        assertEquals(prior, study.path("priorTaskStudySeconds").asLong(-1));
+        assertEquals(session, study.path("studySeconds").asLong(-1));
+        if (study.path("taskId").isNull()) {
+            assertTrue(study.path("totalTaskStudySeconds").isNull());
+        } else {
+            assertEquals(prior + session, study.path("totalTaskStudySeconds").asLong(-1));
+        }
     }
 
     private JsonNode startContext(String token) throws Exception {

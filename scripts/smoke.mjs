@@ -1,11 +1,10 @@
 // Real loopback HTTP with an isolated MySQL database. Uses disposable synthetic records.
 import { spawn } from 'node:child_process';
 import { once } from 'node:events';
-import { mkdir, writeFile } from 'node:fs/promises';
+import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { resolve, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { randomUUID } from 'node:crypto';
-import { createServer } from 'node:net';
 import assert from 'node:assert/strict';
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
@@ -14,7 +13,28 @@ const java = process.env.JAVA_HOME ? resolve(process.env.JAVA_HOME, 'bin', javaE
 const runDir = resolve(root, 'build', 'smoke', randomUUID());
 await mkdir(runDir, { recursive: true });
 const jar = resolve(root, 'build/libs/ganzithon-backend-0.6.0-local.jar');
-const base = 'http://127.0.0.1:18081';
+const openApi = JSON.parse(await readFile(resolve(root, 'docs/implemented.openapi.json'), 'utf8'));
+const operationMethods = new Set(['get', 'put', 'post', 'delete', 'options', 'head', 'patch', 'trace']);
+const documentedPaths = Object.entries(openApi.paths).sort(([a], [b]) =>
+  Number(a.includes('{')) - Number(b.includes('{')));
+const documentedOperations = documentedPaths.flatMap(([path, item]) => Object.keys(item)
+  .filter(method => operationMethods.has(method))
+  .map(method => `${method.toUpperCase()} ${path}`)).sort();
+assert.ok(documentedOperations.length > 0, 'OpenAPI must declare HTTP operations');
+const httpRequests = new Set();
+async function request(url, options) {
+  const response = await fetch(url, options);
+  const pathname = new URL(url).pathname;
+  const exact = Object.hasOwn(openApi.paths, pathname);
+  const matched = exact ? pathname : documentedPaths.find(([template]) => {
+    const segments = template.split('/');
+    const actual = pathname.split('/');
+    return segments.length === actual.length && segments.every((segment, index) =>
+      segment.startsWith('{') ? actual[index].length > 0 : segment === actual[index]);
+  })?.[0];
+  if (matched !== undefined) httpRequests.add(`${options?.method ?? 'GET'} ${matched}`);
+  return response;
+}
 const db = process.env.GANZI_SMOKE_DB_URL ?? '';
 const dbUser = process.env.GANZI_SMOKE_DB_USERNAME ?? '';
 const dbPassword = process.env.GANZI_SMOKE_DB_PASSWORD ?? '';
@@ -22,14 +42,14 @@ const localTestDb = /^jdbc:mysql:\/\/(?:127\.0\.0\.1|localhost)(?::\d{1,5})?\/ga
 assert.match(db, localTestDb, 'Set GANZI_SMOKE_DB_URL to a disposable loopback ganzi_test_smoke database');
 assert.ok(dbUser && dbPassword, 'Set dedicated GANZI_SMOKE_DB_USERNAME and GANZI_SMOKE_DB_PASSWORD');
 
-const probe = createServer();
-await new Promise((ok, fail) => probe.once('error', fail).listen(18081, '127.0.0.1', ok));
-await new Promise(ok => probe.close(ok));
 let child;
+let base;
 let log = '';
 const delay = ms => new Promise(ok => setTimeout(ok, ms));
 async function start({demo = false, guestLimit = 30, chatEnabled = false} = {}) {
-  child = spawn(java, ['-jar', jar, '--server.address=127.0.0.1', '--server.port=18081',
+  base = undefined;
+  let startupLog = '';
+  child = spawn(java, ['-jar', jar, '--server.address=127.0.0.1', '--server.port=0',
     `--spring.profiles.active=${demo ? 'demo' : 'local'}`,
     `--ganzi.chat.enabled=${chatEnabled}`,
     '--ganzi.push.enabled=false', '--ganzi.chat.memory.archive-enabled=false',
@@ -39,14 +59,23 @@ async function start({demo = false, guestLimit = 30, chatEnabled = false} = {}) 
     '--spring.sql.init.mode=always',
     `--spring.datasource.url=${db}`], { cwd: root, windowsHide: true,
     env: { ...process.env, OPENAI_API_KEY: '', SPRING_DATASOURCE_USERNAME: dbUser, SPRING_DATASOURCE_PASSWORD: dbPassword } });
-  child.stdout.on('data', chunk => { log += chunk; });
+  child.stdout.on('data', chunk => {
+    log += chunk;
+    if (base) return;
+    startupLog += chunk;
+    // Learn the port from this instance after it binds, including after each restart.
+    const port = startupLog.match(/Tomcat started on port (\d+) \(http\)/)?.[1];
+    if (port) base = `http://127.0.0.1:${port}`;
+  });
   child.stderr.on('data', chunk => { log += chunk; });
   let spawnError;
   child.on('error', error => { spawnError = error; });
   for (let attempt = 0; attempt < 160; attempt++) {
     if (spawnError) throw spawnError;
     if (child.exitCode !== null) throw new Error(`Server exited: ${child.exitCode}`);
-    try { if ((await fetch(base + '/health', { signal: AbortSignal.timeout(500) })).ok) return; } catch {}
+    if (base) {
+      try { if ((await request(base + '/health', { signal: AbortSignal.timeout(500) })).ok) return; } catch {}
+    }
     await delay(250);
   }
   throw new Error('Server start timed out');
@@ -60,7 +89,7 @@ async function stop() {
   child = undefined;
 }
 async function api(method, path, token, body, expected = 200) {
-  const response = await fetch(base + path, { method,
+  const response = await request(base + path, { method,
     headers: { ...(token ? { Authorization: `Bearer ${token}` } : {}),
       ...(body ? { 'Content-Type': 'application/json' } : {}) },
     ...(body ? { body: JSON.stringify(body) } : {}), signal: AbortSignal.timeout(5000) });
@@ -70,7 +99,7 @@ async function api(method, path, token, body, expected = 200) {
 }
 try {
   await start();
-  assert.equal((await fetch(base + '/demo/index.html')).status, 404);
+  assert.equal((await request(base + '/demo/index.html')).status, 404);
   await api('GET', '/api/v1/me', null, null, 401);
   const guest = await api('POST', '/api/v1/guest-sessions', null, null, 201);
   const token = guest.accessToken; // Kept in memory only; never written to results or logs.
@@ -80,17 +109,17 @@ try {
   const installationId = randomUUID();
   await api('PUT', `/api/v1/push-devices/${installationId}`, token,
     { expoPushToken: `ExpoPushToken[${randomUUID().replaceAll('-', '')}]` });
-  const unsupported = await fetch(base + '/api/v1/tasks', {
+  const unsupported = await request(base + '/api/v1/tasks', {
     method: 'POST', headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'text/plain' },
     body: 'synthetic-invalid-body', signal: AbortSignal.timeout(5000) });
   assert.equal(unsupported.status, 415);
   assert.equal((await unsupported.json()).code, 'UNSUPPORTED_MEDIA_TYPE');
-  const unacceptable = await fetch(base + '/api/v1/me', {
+  const unacceptable = await request(base + '/api/v1/me', {
     headers: { Authorization: `Bearer ${token}`, Accept: 'application/xml' },
     signal: AbortSignal.timeout(5000) });
   assert.equal(unacceptable.status, 406);
   assert.equal((await unacceptable.json()).code, 'NOT_ACCEPTABLE');
-  const wrongMethod = await fetch(base + '/api/v1/guest-sessions', {
+  const wrongMethod = await request(base + '/api/v1/guest-sessions', {
     signal: AbortSignal.timeout(5000) });
   assert.equal(wrongMethod.status, 405);
   assert.ok(wrongMethod.headers.get('allow')?.split(/,\s*/).includes('POST'));
@@ -100,17 +129,19 @@ try {
   assert.equal(usage.timeZone, 'UTC');
   assert.equal(usage.daily.requests, 0);
   assert.equal(usage.dailyRequestLimit, 100);
-  assert.equal(usage.availability, 'AVAILABLE');
+  assert.equal(usage.availability, 'CHAT_NOT_CONFIGURED');
   assert.equal((await api('GET', '/api/v1/me', token)).userId, guest.userId);
   const dueDate = new Date(Date.now() + 2 * 86400000).toISOString().slice(0, 10);
-  const task = await api('POST', '/api/v1/tasks', token, { title: '합성 시험용 할 일', dueDate }, 201);
+  const taskInput = { clientRequestId: randomUUID(), title: '합성 시험용 할 일', dueDate };
+  const task = await api('POST', '/api/v1/tasks', token, taskInput, 201);
   const candidates = await api('GET', '/api/v1/task-reminders?timeZone=UTC', token);
   assert.equal(candidates.items[0].taskId, task.id);
   assert.equal(candidates.items[0].dueDate, dueDate);
   assert.equal((await api('GET', `/api/v1/tasks/${task.id}`, token)).title, task.title);
   assert.equal((await api('GET', '/api/v1/tasks?status=TODO', token)).items.length, 1);
-  const childTask = await api('POST', '/api/v1/tasks/' + task.id + '/subtasks', token,
-    { title: '합성 시험용 세부 항목' }, 201);
+  const subtaskPath = '/api/v1/tasks/' + task.id + '/subtasks';
+  const childInput = { clientRequestId: randomUUID(), title: '합성 시험용 세부 항목' };
+  const childTask = await api('POST', subtaskPath, token, childInput, 201);
   await api('PATCH', '/api/v1/tasks/' + task.id + '/subtasks/' + childTask.id,
     token, { status: 'DONE' });
   const taskDetail = await api('GET', '/api/v1/tasks/' + task.id, token);
@@ -135,20 +166,38 @@ try {
   await stop();
   await delay(1100);
   await start();
+  // The client can lose the creation response before a server restart and retry afterwards.
+  assert.equal((await api('POST', '/api/v1/tasks', token, taskInput)).id, task.id);
+  assert.equal((await api('POST', subtaskPath, token, childInput)).id, childTask.id);
+  const taskPath = '/api/v1/tasks/' + task.id;
+  const editor = await api('GET', taskPath, token);
+  assert.equal(editor.subtasks.length, 1);
+  const editA = await api('PATCH', taskPath, token, { title:'수정된 제목', expectedVersion: editor.version });
+  const nextDate = new Date(Date.now() + 3 * 86400000).toISOString().slice(0, 10);
+  const conflict = await api('PATCH', taskPath, token,
+    { title:editor.title, dueDate:nextDate, expectedVersion:editor.version }, 409);
+  assert.equal(conflict.code, 'TASK_VERSION_CONFLICT');
+  const refreshed = await api('GET', taskPath, token);
+  assert.equal(refreshed.title, editA.title);
+  assert.equal(refreshed.dueDate, dueDate);
+  const editB = await api('PATCH', taskPath, token, { dueDate:nextDate, expectedVersion:refreshed.version });
+  assert.equal(editB.title, '수정된 제목');
+  assert.equal(editB.dueDate, nextDate);
   const current = await api('GET', '/api/v1/study-sessions/current', token);
   assert.equal(current.studySession.id, study.id);
   assert.equal(current.studySession.status, 'PAUSED');
   assert.equal(current.studySession.studySeconds, pausedSeconds);
+  assert.equal(current.studySession.totalTaskStudySeconds, pausedSeconds);
   const returned = await api('PUT', `/api/v1/study-sessions/${study.id}/presence`, token,
     { installationId, eventId: randomUUID(), sequence: 2, state: 'FOREGROUND' });
   assert.equal(returned.deliveryStatus, 'CANCELED');
   assert.equal(returned.dueAt, null);
   await api('DELETE', `/api/v1/push-devices/${installationId}`, token, null, 204);
   assert.equal((await api('GET', '/api/v1/tasks/' + task.id, token)).subtasks[0].status, 'DONE');
-  const denied = await fetch(base + '/api/v1/tasks', {
+  const denied = await request(base + '/api/v1/tasks', {
     headers: { Origin: 'https://unlisted.example.test' }, signal: AbortSignal.timeout(5000) });
   assert.equal(denied.status, 403);
-  const unauthorized = await fetch(base + '/api/v1/tasks', {
+  const unauthorized = await request(base + '/api/v1/tasks', {
     headers: { Origin: 'http://localhost:7891' }, signal: AbortSignal.timeout(5000) });
   assert.equal(unauthorized.status, 401);
   assert.equal(unauthorized.headers.get('access-control-allow-origin'), 'http://localhost:7891');
@@ -184,6 +233,7 @@ try {
     { ...change, remindAt: new Date(Date.now() + 10800000).toISOString() }, 409);
   assert.equal(stale.code, 'REMINDER_PRECONDITION_FAILED');
   const newer = await api('POST', '/api/v1/study-sessions', token, { clientRequestId: randomUUID() }, 201);
+  assert.equal(newer.totalTaskStudySeconds, null);
   assert.equal((await api('GET', '/api/v1/start-reminders/current', token)).reminder, null);
   assert.equal((await api('PUT', reminderPath, token, { remindAt: change.remindAt, timeZone: change.timeZone })).reminder.canceledReason, 'NEW_STUDY');
   await api('DELETE', `/api/v1/start-reminders/${planned.reminder.id}`, token, null, 204);
@@ -192,6 +242,7 @@ try {
   const disabled = await api('POST', '/api/v1/chat/exchanges', token,
     { clientRequestId: chatId, content: '합성 채팅 입력' }, 503);
   assert.equal(disabled.code, 'CHAT_NOT_CONFIGURED');
+  assert.equal(disabled.retryable, false);
   assert.deepEqual((await api('GET', '/api/v1/chat/exchanges?clientRequestId=' + chatId, token)).items, []);
   await api('DELETE', '/api/v1/tasks/' + task.id + '/subtasks/' + childTask.id, token, null, 204);
   assert.equal((await api('GET', '/api/v1/tasks/' + task.id, token)).subtaskSummary.ratio, null);
@@ -221,18 +272,21 @@ try {
   assert.equal((await api('GET', '/api/v1/tasks', linked.accessToken)).items.length, 1);
   await stop();
   await start({demo:true, chatEnabled:true});
-  const page = await fetch(base + '/demo/index.html');
+  const page = await request(base + '/demo/index.html');
   assert.equal(page.status, 200);
   assert.ok(page.headers.get('content-security-policy').includes("script-src 'self'"));
   for (const path of ['/demo/app.js','/demo/styles.css','/demo/assets/reference-flow.png']) {
-    assert.equal((await fetch(base + path)).status, 200);
+    assert.equal((await request(base + path)).status, 200);
   }
   await api('GET', '/api/v1/me', null, null, 401);
   const login = await api('POST', '/api/v1/auth/login', null, {email,password});
   assert.equal(login.userId, retained.userId);
+  const unavailable = await api('GET', '/api/v1/chat/usage', login.accessToken);
+  assert.equal(unavailable.availability, 'CHAT_NOT_CONFIGURED');
   const missingKey = await api('POST', '/api/v1/chat/exchanges', login.accessToken,
     { clientRequestId: randomUUID(), content: '키 없는 합성 시험' }, 503);
   assert.equal(missingKey.code, 'CHAT_NOT_CONFIGURED');
+  assert.equal(missingKey.retryable, false);
   await api('POST', '/api/v1/auth/password', login.accessToken,
     {currentPassword:'의도적으로 잘못된 비밀번호',newPassword:nextPassword}, 401);
   assert.equal((await api('GET', '/api/v1/me', login.accessToken)).accountType, 'EMAIL');
@@ -250,15 +304,20 @@ try {
   await stop();
   await start({guestLimit:1});
   await api('POST', '/api/v1/guest-sessions', null, null, 201);
-  const limited = await fetch(base + '/api/v1/guest-sessions', {
+  const limited = await request(base + '/api/v1/guest-sessions', {
     method:'POST', headers:{Origin:'http://localhost:7891'}
   });
   assert.equal(limited.status, 429);
   assert.ok(Number(limited.headers.get('retry-after')) > 0);
   assert.equal(limited.headers.get('access-control-allow-origin'), 'http://localhost:7891');
   assert.equal((await limited.json()).code, 'RATE_LIMITED');
+  const exercisedOperations = documentedOperations.filter(operation => httpRequests.has(operation));
+  const unexercisedOperations = documentedOperations.filter(operation => !httpRequests.has(operation));
   const report = { passed: true, applicationVersion: '0.6.0-local', databaseEngine: 'MySQL',
-    implementedOperations: 33, checks: ['real HTTP: all 33 routes, AI and push external delivery disabled',
+    implementedOperations: documentedOperations.length, exercisedOperations, unexercisedOperations,
+    checks: ['real loopback HTTP with AI and push external delivery disabled',
+    'task and subtask creation replay original IDs after an application restart',
+    'stale task form returns 409; a refreshed date-only edit preserves the updated title',
     'private durable chat history route and cursor limit validation',
     'push device registration/removal and durable five-minute departure intent with exact-event replay',
     'foreground return after app restart clears departure delivery',

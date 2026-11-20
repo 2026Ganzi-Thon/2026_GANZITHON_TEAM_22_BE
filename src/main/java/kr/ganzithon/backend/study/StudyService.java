@@ -42,7 +42,7 @@ public class StudyService {
     private record Session(UUID id, UUID taskId, UUID startRequestId, String startRequestHash,
                            String status, int version, long accumulatedMs,
                            OffsetDateTime runningStartedAt, OffsetDateTime startedAt,
-                           OffsetDateTime endedAt, String endReason) { }
+                           OffsetDateTime endedAt, String endReason, long priorTaskStudyMs) { }
 
     private static final RowMapper<Session> SESSION_MAPPER = (rs, rowNum) -> new Session(
             PortableJdbc.uuid(rs, "id"), PortableJdbc.uuid(rs, "task_id"),
@@ -50,11 +50,18 @@ public class StudyService {
             rs.getString("status"), rs.getInt("version"), rs.getLong("accumulated_ms"),
             PortableJdbc.utc(rs, "running_started_at"),
             PortableJdbc.utc(rs, "started_at"),
-            PortableJdbc.utc(rs, "ended_at"), rs.getString("end_reason"));
+            PortableJdbc.utc(rs, "ended_at"), rs.getString("end_reason"), rs.getLong("prior_task_study_ms"));
 
-    private static final String SELECT_COLUMNS = "SELECT id, task_id, start_request_id, start_request_hash, "
-            + "status, version, accumulated_ms, running_started_at, started_at, ended_at, end_reason "
-            + "FROM study_sessions ";
+    private static final String SELECT_COLUMNS = """
+            SELECT id, task_id, start_request_id, start_request_hash, status, version, accumulated_ms,
+                   running_started_at, started_at, ended_at, end_reason,
+                   (SELECT COALESCE(SUM(history.accumulated_ms), 0)
+                    FROM study_sessions history
+                    WHERE history.user_id = session_row.user_id AND history.task_id = session_row.task_id
+                      AND history.status = 'ENDED' AND history.ended_at <= session_row.started_at
+                      AND history.id <> session_row.id) AS prior_task_study_ms
+            FROM study_sessions session_row
+            """;
 
     @Transactional
     public StartResult start(UUID userId, UUID clientRequestId, UUID taskId) {
@@ -190,9 +197,13 @@ public class StudyService {
     }
 
     private StudySessionDto toDto(Session session, OffsetDateTime serverTime) {
+        long currentStudyMs = elapsedTotal(session, serverTime);
+        Long totalTaskStudySeconds = session.taskId() == null ? null
+                : (session.priorTaskStudyMs() + currentStudyMs) / 1000L;
         return new StudySessionDto(session.id(), session.taskId(), session.status(), session.version(),
                 session.startedAt(), session.endedAt(), session.endReason(),
-                elapsedTotal(session, serverTime) / 1000L, session.runningStartedAt(),
+                currentStudyMs / 1000L, session.priorTaskStudyMs() / 1000L, totalTaskStudySeconds,
+                session.runningStartedAt(),
                 session.startRequestId(), serverTime);
     }
 

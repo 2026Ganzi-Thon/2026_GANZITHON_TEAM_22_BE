@@ -58,6 +58,8 @@ public class ChatService {
     private final Map<UUID, Key> inFlight = new HashMap<>();
     private final Duration responseDeadline;
     private final boolean intentRoutingEnabled;
+    @Value("${ganzi.chat.safety-support-enabled:false}")
+    private boolean safetySupportEnabled;
     private long completionOrder;
 
     private static final class Entry {
@@ -70,6 +72,7 @@ public class ChatService {
         String failureCode;
         Instant finishedAt;
         long completedOrder;
+        Pending pending;
 
         Entry(UUID userId, ChatDto.Request request, Instant createdAt) {
             this.userId = userId;
@@ -79,7 +82,7 @@ public class ChatService {
 
         ChatDto.Exchange view() {
             return new ChatDto.Exchange(id, request.clientRequestId(), request.studySessionId(),
-                    status, utterances, failureCode, createdAt, finishedAt);
+                    status, utterances, failureCode, createdAt, "PROCESSING".equals(status) ? null : finishedAt);
         }
     }
 
@@ -123,6 +126,8 @@ public class ChatService {
 
     ChatDto.Exchange create(UUID userId, ChatDto.Request request, String requestId) {
         Key key = new Key(userId, request.clientRequestId());
+        Entry retry = claimPending(key, request);
+        if (retry != null) return finish(key, retry, retry.pending, requestId);
         ChatProvider model;
         Entry entry;
         String previousUserContent = null;
@@ -130,6 +135,8 @@ public class ChatService {
         String memoryContext = null;
         ChatMemoryService.Transcript transcript;
         String studyState;
+        // Classification uses only this message. Apply the result after ownership and replay checks.
+        ApiException safetyResponse = safetySupportEnabled ? ChatSafetySupport.responseFor(request.content()) : null;
         synchronized (this) {
             requireOwner(userId);
             evictExpired(clock.instant());
@@ -159,13 +166,19 @@ public class ChatService {
             }
             if (request.previousRequestId() != null) {
                 Entry previous = immediatelyPrevious(userId, request.studySessionId());
-                if (previous != null && "CHAT_MEMORY_WRITE_FAILED".equals(previous.failureCode)) {
+                var durablePrevious = memory == null ? null : memory.latest(userId, request.studySessionId()).orElse(null);
+                // A retained result is shared by every server. The process-local cache may
+                // contain an older turn when a different server completed the next one.
+                // An unretained local result still blocks a link if it finished later.
+                boolean localIsLatest = previous != null && (memory == null
+                        || previous.pending != null && (durablePrevious == null
+                                || !previous.finishedAt.isBefore(durablePrevious.exchange().finishedAt())));
+                if (localIsLatest && "CHAT_MEMORY_WRITE_FAILED".equals(previous.failureCode)) {
                     throw new ApiException(409, "INVALID_PREVIOUS_EXCHANGE", "Latest exchange was not retained");
                 }
-                var durablePrevious = memory == null ? null : memory.latest(userId, request.studySessionId()).orElse(null);
-                ChatDto.Request previousRequest = previous != null ? previous.request
+                ChatDto.Request previousRequest = localIsLatest ? previous.request
                     : durablePrevious == null ? null : durablePrevious.request();
-                ChatDto.Exchange previousView = previous != null ? previous.view()
+                ChatDto.Exchange previousView = localIsLatest ? previous.view()
                     : durablePrevious == null ? null : durablePrevious.exchange();
                 if (previousRequest == null || !previousRequest.clientRequestId().equals(request.previousRequestId())
                         || !"SUCCEEDED".equals(previousView.status())) {
@@ -177,9 +190,10 @@ public class ChatService {
                         .map(line -> line.characterKey() + ": " + line.content())
                         .reduce((a, b) -> a + "\n" + b).orElse("");
             }
+            if (safetyResponse != null) throw safetyResponse;
             model = provider.getIfAvailable();
             if (model == null) {
-                throw new ApiException(503, "CHAT_NOT_CONFIGURED", "AI chat is not configured");
+                throw new ApiException(503, "CHAT_NOT_CONFIGURED", "대화 서비스 설정이 완료되지 않았습니다.", false);
             }
             model.ensureConfigured();
             if (memory != null) {
@@ -273,31 +287,57 @@ public class ChatService {
             failureLogged = true;
         }
 
+        Pending pending = new Pending(utterances, failureCode, failureLogged, reservation, usage,
+                chargeableUnknown, clock.instant());
+        return finish(key, entry, pending, requestId);
+    }
+
+    private record Pending(List<ChatDto.Utterance> utterances, String failureCode, boolean failureLogged,
+                           ChatBudgetService.Reservation reservation, ChatProvider.Usage usage,
+                           boolean chargeableUnknown, Instant modelFinishedAt) { }
+
+    private synchronized Entry claimPending(Key key, ChatDto.Request replay) {
+        evictExpired(clock.instant());
+        Entry entry = entries.get(key);
+        if (entry == null || entry.pending == null || "PROCESSING".equals(entry.status)) return null;
+        requireOwner(key.userId());
+        if (replay != null && !entry.request.equals(replay)) {
+            throw new ApiException(409, "CLIENT_REQUEST_ID_REUSED", "This request ID was used with different input");
+        }
+        if (inFlight.putIfAbsent(key.userId(), key) != null) return null;
+        entry.status = "PROCESSING";
+        entry.failureCode = null;
+        return entry;
+    }
+
+    private ChatDto.Exchange finish(Key key, Entry entry, Pending pending, String requestId) {
         try {
-            Completion completion = complete(entry, utterances, failureCode, failureLogged,
-                    reservation, usage, chargeableUnknown, requestId);
+            Completion completion = complete(entry, pending.utterances(), pending.failureCode(), pending.failureLogged(),
+                    pending.reservation(), pending.usage(), pending.chargeableUnknown(), requestId, pending.modelFinishedAt());
             synchronized (this) {
                 if (entries.get(key) != entry) throw accountUnavailable();
                 ChatDto.Exchange result = completion.result();
-                if (completion.retained() && result.id().equals(entry.id)) {
+                if (result.id().equals(entry.id) && (completion.retained() || memory != null)) {
+                    entry.pending = completion.retained() ? null : pending;
                     entry.utterances = result.utterances();
                     entry.failureCode = result.failureCode();
                     entry.status = result.status();
-                    entry.finishedAt = result.finishedAt();
-                    entry.completedOrder = ++completionOrder;
+                    entry.finishedAt = completion.retained() ? result.finishedAt() : pending.modelFinishedAt();
+                    if (entry.completedOrder == 0) entry.completedOrder = ++completionOrder;
                 } else {
                     entries.remove(key);
                 }
-                inFlight.remove(userId, key);
+                inFlight.remove(entry.userId, key);
                 return result;
             }
-        } finally {
+        } catch (RuntimeException | Error ex) {
             synchronized (this) {
-                if (entries.get(key) == entry && "PROCESSING".equals(entry.status)) {
+                if (entries.get(key) == entry) {
                     entries.remove(key);
-                    inFlight.remove(userId, key);
+                    inFlight.remove(entry.userId, key);
                 }
             }
+            throw ex;
         }
     }
 
@@ -316,7 +356,7 @@ public class ChatService {
 
     private Completion complete(Entry entry, List<ChatDto.Utterance> utterances,
                                 String failureCode, boolean failureLogged, ChatBudgetService.Reservation reservation,
-                                ChatProvider.Usage usage, boolean chargeableUnknown, String requestId) {
+                                ChatProvider.Usage usage, boolean chargeableUnknown, String requestId, Instant modelFinishedAt) {
         UUID userId = entry.userId;
         UUID sessionId = entry.request.studySessionId();
         // Account deletion may have happened while the external provider was running.
@@ -336,13 +376,13 @@ public class ChatService {
             throw accountUnavailable();
         }
         if (failureCode == null && !roomStillActive) failureCode = "STUDY_SESSION_ENDED";
-        if (failureCode == null && clock.instant().isAfter(entry.createdAt.plus(responseDeadline))) {
+        if (failureCode == null && modelFinishedAt.isAfter(entry.createdAt.plus(responseDeadline))) {
             failureCode = "CHAT_DEADLINE_EXCEEDED";
         }
         if (failureCode != null && !failureLogged) SafeExceptionLogger.event(log, requestId, failureCode);
         ChatDto.Exchange pending = failureCode == null
                 ? new ChatDto.Exchange(entry.id, entry.request.clientRequestId(), sessionId, "SUCCEEDED",
-                        utterances, null, entry.createdAt, clock.instant())
+                        utterances, null, entry.createdAt, modelFinishedAt)
                 : failed(entry, failureCode);
         try {
             ChatDto.Exchange result = retryTransientDatabase(
@@ -490,6 +530,9 @@ public class ChatService {
     }
 
     public ChatDto.SearchResult recover(UUID userId, UUID clientRequestId) {
+        Key key = new Key(userId, clientRequestId);
+        Entry retry = claimPending(key, null);
+        if (retry != null) return new ChatDto.SearchResult(List.of(finish(key, retry, retry.pending, null)));
         synchronized (this) {
             requireOwner(userId);
             evictExpired(clock.instant());
@@ -553,7 +596,7 @@ public class ChatService {
     }
 
     private void evictExpired(Instant now) {
-        entries.entrySet().removeIf(item -> item.getValue().finishedAt != null
+        entries.entrySet().removeIf(item -> !"PROCESSING".equals(item.getValue().status) && item.getValue().finishedAt != null
                 && !item.getValue().finishedAt.plus(RETENTION).isAfter(now));
     }
 

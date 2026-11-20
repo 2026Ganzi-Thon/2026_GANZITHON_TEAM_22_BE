@@ -34,13 +34,14 @@ public class EmailAuthService {
         String encoded=passwords.hash(password); // The expensive work happens before acquiring a DB lock.
         return Objects.requireNonNull(transactions.execute(status -> {
                 UUID userId=guestId;
+                UUID replacingSessionId=null;
                 Instant now=clock.instant();
                 if (userId == null) {
                     userId=UUID.randomUUID();
                     jdbc.update("INSERT INTO users(id,created_at) VALUES(?,?)",userId,Timestamp.from(now));
                 } else {
                     lockUser(userId);
-                    requireCurrentSession(userId,guestToken);
+                    replacingSessionId=identity.requireCurrentSession(userId,guestToken);
                     if (!jdbc.query("SELECT user_id FROM email_accounts WHERE user_id=?",
                             (rs,i)->PortableJdbc.uuid(rs,1),userId).isEmpty()) {
                         throw new ApiException(409,"ACCOUNT_ALREADY_REGISTERED","이미 이메일 계정이 연결돼 있습니다.");
@@ -52,8 +53,7 @@ public class EmailAuthService {
                 } catch (DuplicateKeyException ex) {
                     throw new ApiException(409,"EMAIL_ALREADY_REGISTERED","이미 등록된 이메일입니다.");
                 }
-                jdbc.update("DELETE FROM auth_sessions WHERE user_id=?",userId);
-                return identity.issueSession(userId,email,false);
+                return identity.issueSession(userId,email,false,replacingSessionId);
             }));
     }
 
@@ -79,9 +79,9 @@ public class EmailAuthService {
     public void logout(UUID userId, String token) {
         transactions.executeWithoutResult(status -> {
             lockUser(userId);
-            requireCurrentSession(userId,token);
-            jdbc.update("DELETE FROM auth_sessions WHERE user_id=? AND secret_hash=?",
-                userId,identity.tokenHash(token));
+            UUID sessionId=identity.requireCurrentSession(userId,token);
+            jdbc.update("DELETE FROM push_devices WHERE user_id=? AND auth_session_id=?",userId,sessionId);
+            jdbc.update("DELETE FROM auth_sessions WHERE user_id=? AND id=?",userId,sessionId);
         });
     }
 
@@ -97,15 +97,14 @@ public class EmailAuthService {
         String replacement=passwords.hash(newPassword);
         return Objects.requireNonNull(transactions.execute(status -> {
             lockUser(userId);
-            requireCurrentSession(userId,token);
+            UUID sessionId=identity.requireCurrentSession(userId,token);
             Account current=findByUser(userId);
             if (current == null || !current.passwordHash().equals(observed.passwordHash())) {
                 throw invalidCredentials();
             }
             jdbc.update("UPDATE email_accounts SET password_hash=?,updated_at=? WHERE user_id=?",
                 replacement,Timestamp.from(clock.instant()),userId);
-            jdbc.update("DELETE FROM auth_sessions WHERE user_id=?",userId);
-            return identity.issueSession(userId,current.email(),current.emailVerified());
+            return identity.issueSession(userId,current.email(),current.emailVerified(),sessionId);
         }));
     }
 
@@ -140,16 +139,6 @@ public class EmailAuthService {
     private void lockUserForLogin(UUID userId) {
         if (jdbc.query("SELECT id FROM users WHERE id=? FOR UPDATE",
                 (rs,i)->PortableJdbc.uuid(rs,1),userId).isEmpty()) throw invalidCredentials();
-    }
-
-    private void requireCurrentSession(UUID userId, String token) {
-        if (token == null) throw new ApiException(401,"AUTH_REQUIRED","인증이 필요합니다.");
-        var valid=jdbc.query("SELECT expires_at FROM auth_sessions "
-                + "WHERE user_id=? AND secret_hash=? AND revoked_at IS NULL",
-            (rs,i)->PortableJdbc.instant(rs,1),userId,identity.tokenHash(token));
-        if (valid.isEmpty() || !valid.getFirst().isAfter(clock.instant())) {
-            throw new ApiException(401,"AUTH_REQUIRED","인증 정보가 올바르지 않습니다.");
-        }
     }
 
     private Account findByEmail(String email) {

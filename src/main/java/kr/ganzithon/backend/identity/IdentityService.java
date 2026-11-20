@@ -64,16 +64,38 @@ public class IdentityService {
     }
 
     AuthSessionDTO issueSession(UUID userId, String email, boolean emailVerified) {
+        return issueSession(userId,email,emailVerified,null);
+    }
+
+    AuthSessionDTO issueSession(UUID userId, String email, boolean emailVerified, UUID replacingSessionId) {
         Instant now=clock.instant();
         byte[] bytes=new byte[32]; random.nextBytes(bytes);
         String secret=Base64.getUrlEncoder().withoutPadding().encodeToString(bytes);
         Instant expiresAt=now.plus(lifetime);
-        jdbc.update("INSERT INTO auth_sessions(id,user_id,secret_hash,expires_at,created_at) VALUES(?,?,?,?,?)",
-            UUID.randomUUID(),userId,sha256(secret),Timestamp.from(expiresAt),Timestamp.from(now));
+        if (replacingSessionId == null) {
+            jdbc.update("INSERT INTO auth_sessions(id,user_id,secret_hash,expires_at,created_at) VALUES(?,?,?,?,?)",
+                UUID.randomUUID(),userId,sha256(secret),Timestamp.from(expiresAt),Timestamp.from(now));
+        } else {
+            // Preserve the current installation binding while invalidating all previous bearer tokens.
+            jdbc.update("DELETE FROM push_devices WHERE user_id=? AND auth_session_id<>?",userId,replacingSessionId);
+            jdbc.update("DELETE FROM auth_sessions WHERE user_id=? AND id<>?",userId,replacingSessionId);
+            jdbc.update("UPDATE auth_sessions SET secret_hash=?,expires_at=?,created_at=? WHERE id=? AND user_id=?",
+                sha256(secret),Timestamp.from(expiresAt),Timestamp.from(now),replacingSessionId,userId);
+        }
         return new AuthSessionDTO(userId,secret,expiresAt,"EMAIL",email,emailVerified);
     }
 
-    String tokenHash(String token) { return sha256(token); }
+    /** Call under the user's row lock to serialize with session revocation and rotation. */
+    public UUID requireCurrentSession(UUID userId, String token) {
+        if (token == null) throw unauthorized();
+        var valid=jdbc.query("SELECT id,expires_at FROM auth_sessions "
+                + "WHERE user_id=? AND secret_hash=? AND revoked_at IS NULL",
+            (rs,i)->new Session(PortableJdbc.uuid(rs,1),PortableJdbc.instant(rs,2)),userId,sha256(token));
+        if (valid.isEmpty() || !valid.getFirst().expiresAt().isAfter(clock.instant())) throw unauthorized();
+        return valid.getFirst().id();
+    }
+
+    private record Session(UUID id, Instant expiresAt) {}
     @Transactional
     public void deleteCurrentUser(UUID userId) {
         // Serialize deletion with task/study writes; never recreate a deleted owner.
