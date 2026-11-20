@@ -114,7 +114,7 @@ public final class AnthropicChatProvider implements ChatProvider {
     public void ensureConfigured() {
         if (apiKey == null || apiKey.isBlank() || model == null || model.isBlank()
             || timeoutSeconds < 1 || timeoutSeconds > 30 || maxTokens < 64 || maxTokens > 1024) {
-            throw new ApiException(503, "CHAT_NOT_CONFIGURED", "대화 서비스 설정이 완료되지 않았습니다.");
+            throw new ApiException(503, "CHAT_NOT_CONFIGURED", "대화 서비스 설정이 완료되지 않았습니다.", false);
         }
     }
 

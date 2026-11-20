@@ -20,6 +20,7 @@ import org.springframework.boot.test.autoconfigure.web.servlet.AutoConfigureMock
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.context.annotation.Import;
 import org.springframework.http.MediaType;
+import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.test.context.ActiveProfiles;
 import org.springframework.test.context.ContextConfiguration;
 import org.springframework.test.web.servlet.MockMvc;
@@ -40,6 +41,7 @@ class ReminderApiIntegrationTest {
     @Autowired ObjectMapper mapper;
     @Autowired BackendApiIntegrationTest.MutableClock clock;
     @Autowired ReminderService reminders;
+    @Autowired JdbcTemplate jdbc;
 
     @BeforeEach void reset() { clock.set(Instant.parse("2026-11-03T00:00:00Z")); }
 
@@ -109,6 +111,56 @@ class ReminderApiIntegrationTest {
         assertTrue(authorized(get("/api/v1/start-reminders/current"), owner, null, 200)
                 .path("reminder").isNull());
         assertEquals("CANCELED", putReminder(owner, path, input, 200).path("reminder").path("status").asText());
+    }
+
+    @Test void staleEndAfterStudyResumeCanRecoverAndReserveTheOriginalTimeOnce() throws Exception {
+        String token = guest();
+        String sid = study(token);
+        String studyPath = STUDIES + "/" + sid;
+        String reminderPath = studyPath + "/next-start-reminder";
+        String originalReminder = "{\"remindAt\":\"2026-11-03T09:30:00+09:00\","
+                + "\"timeZone\":\"Asia/Seoul\"}";
+
+        JsonNode paused = authorized(patch(studyPath), token,
+                "{\"action\":\"PAUSE\",\"expectedVersion\":0}", 200);
+        assertEquals(1, paused.path("version").asInt());
+        JsonNode resumed = authorized(patch(studyPath), token,
+                "{\"action\":\"RESUME\",\"expectedVersion\":1}", 200);
+        assertEquals(2, resumed.path("version").asInt());
+        clock.advanceSeconds(5);
+        JsonNode staleEnd = authorized(patch(studyPath), token,
+                "{\"action\":\"END\",\"expectedVersion\":1}", 409);
+        assertEquals("STUDY_VERSION_CONFLICT", staleEnd.path("code").asText());
+
+        JsonNode latest = authorized(get(studyPath), token, null, 200);
+        assertEquals("STUDYING", latest.path("status").asText());
+        assertEquals(2, latest.path("version").asInt());
+        String endLatestVersion = mapper.createObjectNode().put("action", "END")
+                .put("expectedVersion", latest.required("version").asInt()).toString();
+        JsonNode ended = authorized(patch(studyPath), token, endLatestVersion, 200);
+        assertEquals("ENDED", ended.path("status").asText());
+        assertEquals(3, ended.path("version").asInt());
+
+        clock.advanceSeconds(30);
+        JsonNode recovered = authorized(get(studyPath), token, null, 200);
+        assertEquals("ENDED", recovered.required("status").asText());
+        JsonNode repeatedEnd = authorized(patch(studyPath), token, endLatestVersion, 200);
+        assertEquals(ended.required("endedAt"), repeatedEnd.required("endedAt"));
+        assertEquals(ended.required("version"), repeatedEnd.required("version"));
+
+        JsonNode created = putReminder(token, reminderPath, originalReminder, 201);
+        clock.advanceSeconds(10);
+        JsonNode repeated = putReminder(token, reminderPath, originalReminder, 200);
+        assertEquals(created.path("reminder").path("id").asText(),
+                repeated.path("reminder").path("id").asText());
+        assertEquals("2026-11-03T00:30:00Z", created.at("/reminder/remindAt").asText());
+        assertEquals("Asia/Seoul", created.at("/reminder/timeZone").asText());
+        assertEquals(created.required("reminder"), authorized(get("/api/v1/start-reminders/current"),
+                token, null, 200).required("reminder"));
+        assertEquals(1L, jdbc.queryForObject(
+                "SELECT COUNT(*) FROM start_reminders WHERE source_session_id=?", Long.class, sid).longValue());
+        assertEquals(1L, jdbc.queryForObject(
+                "SELECT COUNT(*) FROM study_sessions WHERE id=? AND status='ENDED'", Long.class, sid).longValue());
     }
 
     @Test void concurrentReservationsAndNextStudyStayWithTheirOwners() throws Exception {

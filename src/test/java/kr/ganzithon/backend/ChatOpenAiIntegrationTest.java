@@ -15,6 +15,8 @@ import kr.ganzithon.backend.identity.IdentityService;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.autoconfigure.web.servlet.AutoConfigureMockMvc;
 import org.springframework.boot.test.context.SpringBootTest;
@@ -32,13 +34,15 @@ import org.springframework.test.web.servlet.MockMvc;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.patch;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
 
 /** Exercises the real HTTP and durable budget path without contacting a paid provider. */
-@SpringBootTest(properties = "ganzi.chat.enabled=false")
+@SpringBootTest(properties = {"ganzi.chat.enabled=false", "ganzi.chat.safety-support-enabled=true"})
 @AutoConfigureMockMvc
 @ActiveProfiles("test")
 @ContextConfiguration(initializers = TestDatabaseGuard.class)
@@ -117,6 +121,59 @@ class ChatOpenAiIntegrationTest {
         assertTrue(recover(other.token(), firstId).path("items").isEmpty());
     }
 
+    @ParameterizedTest
+    @ValueSource(strings = {"지금 죽고 싶어. 방금 친구들한테 작별 인사를 보냈어.", "다들 고마웠다고 인사했어. 오늘 내 삶을 끝낼 생각이야."})
+    void crisisDisclosureGetsFixedSupportBeforeModelBudgetOrHistory(String content) throws Exception {
+        Guest owner = guest();
+        UUID requestId = UUID.randomUUID();
+        var payload = Map.of("clientRequestId", requestId, "content", content);
+        mvc.perform(post("/api/v1/chat/exchanges")
+                .header("Authorization", "Bearer " + owner.token())
+                .contentType(MediaType.APPLICATION_JSON).content(mapper.writeValueAsString(payload)))
+            .andExpect(status().isUnprocessableEntity())
+            .andExpect(jsonPath("$.code").value("CHAT_SAFETY_SUPPORT"))
+            .andExpect(jsonPath("$.retryable").value(false))
+            .andExpect(jsonPath("$.message").value(org.hamcrest.Matchers.containsString("109")));
+        assertEquals(0, provider.calls.get());
+        assertNull(provider.quotedTurn.get());
+        assertEquals(0L, jdbc.queryForObject("SELECT COUNT(*) FROM chat_usage_events WHERE scope=?", Long.class, SCOPE));
+        assertTrue(recover(owner.token(), requestId).path("items").isEmpty());
+        mvc.perform(get("/api/v1/chat/history").header("Authorization", "Bearer " + owner.token()))
+            .andExpect(status().isOk()).andExpect(jsonPath("$.items").isEmpty());
+    }
+
+    @Test
+    void safetySupportRequiresOwnershipOfTheRequestedStudyRoom() throws Exception {
+        Guest owner = guest();
+        Guest other = guest();
+        String room = mvc.perform(post("/api/v1/study-sessions")
+                .header("Authorization", "Bearer " + owner.token())
+                .contentType(MediaType.APPLICATION_JSON)
+                .content(mapper.writeValueAsString(Map.of("clientRequestId", UUID.randomUUID()))))
+            .andExpect(status().isCreated()).andReturn().getResponse().getContentAsString();
+        UUID requestId = UUID.randomUUID();
+        var payload = Map.of("clientRequestId", requestId, "studySessionId", mapper.readTree(room).path("id").asText(),
+                "content", "지금 죽고 싶어.");
+        mvc.perform(post("/api/v1/chat/exchanges")
+                .header("Authorization", "Bearer " + other.token())
+                .contentType(MediaType.APPLICATION_JSON).content(mapper.writeValueAsString(payload)))
+            .andExpect(status().isNotFound())
+            .andExpect(jsonPath("$.code").value("RESOURCE_NOT_FOUND"));
+        assertNull(provider.quotedTurn.get());
+        assertEquals(0, provider.calls.get());
+        assertTrue(recover(other.token(), requestId).path("items").isEmpty());
+        assertTrue(recover(owner.token(), requestId).path("items").isEmpty());
+    }
+
+    @Test
+    void ordinaryStudyStressAndNegatedSelfHarmRemainSupported() throws Exception {
+        Guest owner = guest();
+        for (String content : List.of("오늘은 동아리 마지막 날이라 후배들에게 작별 인사를 했어.", "죽고 싶지 않아요. 잠깐 쉬고 시작할래요.")) {
+            assertEquals("SUCCEEDED", exchange(owner.token(), UUID.randomUUID(), content).path("status").asText());
+        }
+        assertEquals(2, provider.calls.get());
+    }
+
     @Test
     void defaultRoutingUsesOneMeteredCallAndCanBeReplayedWithTheOriginalCandidates() throws Exception {
         Guest owner = guest();
@@ -137,6 +194,27 @@ class ChatOpenAiIntegrationTest {
         assertEquals(reply.path("id").asText(), recover(owner.token(), requestId)
             .path("items").get(0).path("id").asText());
         assertEquals(1, provider.calls.get());
+    }
+
+    @Test
+    void failedTransportReplayRetainsOneAdmissionAndItsOriginalCharge() throws Exception {
+        Guest owner = guest();
+        for (String mode : List.of("connect_failure", "lost_response")) {
+            boolean uncertain = mode.equals("lost_response");
+            UUID id = UUID.randomUUID();
+            JsonNode failed = exchange(owner.token(), id, mode);
+            assertEquals("AI_PROVIDER_FAILED", failed.path("failureCode").asText());
+            assertEquals(failed, exchange(owner.token(), id, mode));
+            assertEquals(uncertain ? 2 : 1, provider.calls.get());
+            JsonNode daily = usage(owner.token()).path("daily");
+            assertEquals(provider.calls.get(), daily.path("requests").asInt());
+            assertEquals(0, daily.path("reservedUsd").decimalValue().signum());
+            assertEquals(0, daily.path("estimatedUsd").decimalValue().compareTo(
+                    uncertain ? new BigDecimal("0.006280000") : BigDecimal.ZERO));
+            assertEquals(uncertain ? "UNKNOWN" : "REJECTED", jdbc.queryForObject(
+                    "SELECT status FROM chat_usage_events WHERE scope=? AND client_request_id=?",
+                    String.class, SCOPE, id.toString()));
+        }
     }
 
     @Test
@@ -264,6 +342,8 @@ class ChatOpenAiIntegrationTest {
         public Reply generate(String content, String priorUser, String priorAssistant,
                               List<String> characterKeys) {
             calls.incrementAndGet();
+            if (content.equals("connect_failure") || content.equals("lost_response"))
+                throw new ChatProviderException("AI_PROVIDER_FAILED", content.equals("lost_response"), null);
             if (content.equals("credit_exhausted")) {
                 throw new ChatProviderException("AI_CREDIT_EXHAUSTED", false, null);
             }

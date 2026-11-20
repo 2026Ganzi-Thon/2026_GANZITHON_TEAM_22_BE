@@ -13,6 +13,7 @@ import kr.ganzithon.backend.common.ApiException;
 import kr.ganzithon.backend.common.PortableJdbc;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.lang.Nullable;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Propagation;
@@ -24,6 +25,7 @@ public class ChatBudgetService {
     private static final BigDecimal NANOS_PER_USD = new BigDecimal("1000000000");
     // The response deadline is at most 120 seconds. Allow extra time for provider and DB cleanup.
     private static final Duration RESERVATION_TIMEOUT = Duration.ofMinutes(5);
+    private final ChatProvider provider;
     private final PortableJdbc jdbc;
     private final Clock clock;
     private final String scope;
@@ -37,7 +39,9 @@ public class ChatBudgetService {
             @Value("${ganzi.chat.budget.daily-usd:1}") BigDecimal dailyUsd,
             @Value("${ganzi.chat.budget.monthly-usd:10}") BigDecimal monthlyUsd,
             @Value("${ganzi.chat.budget.user-daily-requests:100}") int userDailyLimit,
-            @Value("${ganzi.chat.budget.billing-epoch:1}") long billingEpoch) {
+            @Value("${ganzi.chat.budget.billing-epoch:1}") long billingEpoch,
+            @Nullable ChatProvider provider) {
+        this.provider = provider;
         this.jdbc = new PortableJdbc(jdbc);
         this.clock = clock;
         if (!scope.matches("[A-Za-z0-9_-]{1,32}") || userDailyLimit < 1 || userDailyLimit > 100000
@@ -87,30 +91,14 @@ public class ChatBudgetService {
         }
         String blockedReason = blockedReason();
         if (blockedReason != null) throw failure(blockedReason);
-        long inputRate = switch (quote.model()) {
-            case "gpt-6-luna" -> 250; // Standard input, including a conservative 2.5x cache-write allowance.
-            case "gpt-6.1-terra" -> 2500;
-            case "gpt-6.1-sol" -> 5000;
-            case "gpt-6.2-sol" -> 2500; // Reserve every input token at the 30-minute cache-write rate.
-            default -> throw failure("AI_MODEL_PRICE_NOT_CONFIGURED");
-        };
-        long ordinaryRate = "gpt-6.2-sol".equals(quote.model()) ? 2000 : inputRate;
-        long cachedRate = "gpt-6.2-sol".equals(quote.model()) ? 100 : inputRate;
-        long outputRate = switch (quote.model()) {
-            case "gpt-6-luna" -> 500;
-            case "gpt-6.1-terra" -> 5000;
-            case "gpt-6.1-sol" -> 10000;
-            case "gpt-6.2-sol" -> 10000;
-            default -> throw failure("AI_MODEL_PRICE_NOT_CONFIGURED");
-        };
+        Rates rates = rates(quote.model());
         if (quote.maxInputTokens() < 1 || quote.maxInputTokens() > 200000
                 || quote.maxOutputTokens() < 1 || quote.maxOutputTokens() > 4096) {
             throw failure("AI_REQUEST_TOO_LARGE");
         }
         LocalDate day = today();
         LocalDate month = day.withDayOfMonth(1);
-        long reserved = Math.addExact(Math.multiplyExact(quote.maxInputTokens(), inputRate),
-                Math.multiplyExact(quote.maxOutputTokens(), outputRate));
+        long reserved = rates.reservation(quote);
         ensurePeriod("MONTH", month);
         ensurePeriod("DAY", day);
         if (total("MONTH", month) > monthlyLimit - reserved || total("DAY", day) > dailyLimit - reserved) {
@@ -124,7 +112,7 @@ public class ChatBudgetService {
                 + "cache_write_nano_rate,output_nano_rate,max_input_tokens,max_output_tokens,status,created_at) "
                 + "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'RESERVED',?)",
                 id, scope, userId, requestId, requestHash, quote.model(), day, month, reserved,
-                ordinaryRate, cachedRate, inputRate, outputRate,
+                rates.ordinary(), rates.cached(), rates.input(), rates.output(),
                 quote.maxInputTokens(), quote.maxOutputTokens(), clock.instant());
         adjust("MONTH", month, 0, reserved);
         adjust("DAY", day, 0, reserved);
@@ -231,14 +219,46 @@ public class ChatBudgetService {
     public UsageView usage(UUID userId) {
         requireOwner(userId, false);
         LocalDate day = today();
-        String reason = blockedReason();
-        String availability = reason == null ? "AVAILABLE" : reason;
-        if (availability.equals("AVAILABLE") && (total("DAY", day) >= dailyLimit
-                || total("MONTH", day.withDayOfMonth(1)) >= monthlyLimit)) availability = "AI_BUDGET_EXCEEDED";
+        String availability = availability(day);
         PeriodUsage daily = usagePeriod(userId, "day_start", day);
         if (availability.equals("AVAILABLE") && daily.requests() >= userDailyLimit) availability = "AI_DAILY_USAGE_EXCEEDED";
         return new UsageView("UTC", daily, usagePeriod(userId, "month_start", day.withDayOfMonth(1)),
                 userDailyLimit, availability);
+    }
+
+    private String availability(LocalDate day) {
+        if (provider == null) return "CHAT_NOT_CONFIGURED";
+        try {
+            provider.ensureConfigured();
+        } catch (ApiException ex) {
+            if ("CHAT_NOT_CONFIGURED".equals(ex.code())) return ex.code();
+            throw ex;
+        }
+        String blocked = blockedReason();
+        if (blocked != null) return blocked;
+        ChatProvider.CostQuote floor = provider.minimumReservationQuote();
+        long minimum = floor == null ? 1L : rates(floor.model()).reservation(floor);
+        if (total("DAY", day) > dailyLimit - minimum
+                || total("MONTH", day.withDayOfMonth(1)) > monthlyLimit - minimum) return "AI_BUDGET_EXCEEDED";
+        return "AVAILABLE";
+    }
+
+    private record Rates(long input, long ordinary, long cached, long output) {
+        long reservation(ChatProvider.CostQuote quote) {
+            return Math.addExact(Math.multiplyExact(quote.maxInputTokens(), input),
+                    Math.multiplyExact(quote.maxOutputTokens(), output));
+        }
+    }
+
+    private static Rates rates(String model) {
+        return switch (model) {
+            case "gpt-6-luna" -> new Rates(250, 250, 250, 500);
+            case "gpt-6.1-terra" -> new Rates(2500, 2500, 2500, 5000);
+            case "gpt-6.1-sol" -> new Rates(5000, 5000, 5000, 10000);
+            // Reserve all input at the cache-write rate. Settle ordinary and cached input separately.
+            case "gpt-6.2-sol" -> new Rates(2500, 2000, 100, 10000);
+            default -> throw failure("AI_MODEL_PRICE_NOT_CONFIGURED");
+        };
     }
 
     private PeriodUsage usagePeriod(UUID userId, String column, LocalDate start) {

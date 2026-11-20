@@ -49,6 +49,9 @@ public class ChatMemoryService {
     private static final int MAX_TERMS = 12;
     private static final Duration RAW_RETENTION = Duration.ofDays(60);
     private static final Pattern WORD = Pattern.compile("[\\p{L}\\p{N}]{2,32}");
+    private static final Pattern HANGUL_WORD = Pattern.compile("[가-힣]{2,32}");
+    private static final List<String> VOWEL_PARTICLES = List.of("는", "가", "를", "와", "도");
+    private static final List<String> CONSONANT_PARTICLES = List.of("은", "이", "을", "과", "도");
     private static final Set<String> STOPWORDS = Set.of("그리고", "그런데", "그래서", "오늘", "내일", "제가", "저는", "이거", "이제", "정말", "다시", "지금", "하는", "있어", "없어", "같이", "공부", "과제", "캐릭터");
     private static final String COLUMNS = "id,sequence_id,user_id,client_request_id,study_session_id,status,request_hash,payload_sha256,payload_bytes,raw_payload,compressed_payload,created_at,finished_at,archived_at";
 
@@ -265,18 +268,30 @@ public class ChatMemoryService {
         }
         Set<String> clues = terms(currentInput);
         if (!clues.isEmpty()) {
-            String placeholders = String.join(",", java.util.Collections.nCopies(clues.size(), "?"));
+            Set<String> variants = particleVariants(clues);
             List<Object> args = new ArrayList<>();
             args.add(userId);
+            for (String term : variants) args.add(sha(term.getBytes(StandardCharsets.UTF_8)));
+            if (excludedRequestId != null) args.add(excludedRequestId);
+            Set<UUID> excludedIds = new LinkedHashSet<>(transcriptIds);
+            excludedIds.addAll(selected.keySet());
+            args.addAll(excludedIds);
             for (String term : clues) args.add(sha(term.getBytes(StandardCharsets.UTF_8)));
-            args.addAll(transcriptIds);
             args.add(12);
-            String matchExclusion = transcriptIds.isEmpty() ? "" : " AND m.id NOT IN ("
-                    + String.join(",", java.util.Collections.nCopies(transcriptIds.size(), "?")) + ")";
-            List<UUID> matches = read(() -> jdbc.query("SELECT t.memory_id FROM chat_memory_terms t JOIN chat_memory m ON m.user_id=t.user_id AND m.id=t.memory_id WHERE t.user_id=? AND m.status='SUCCEEDED' AND NOT EXISTS (SELECT 1 FROM chat_memory_quarantine q WHERE q.memory_id=m.id) AND t.term_hash IN (" + placeholders + ")" + matchExclusion + " GROUP BY t.memory_id ORDER BY COUNT(*) DESC,MAX(m.finished_at) DESC,MAX(m.sequence_id) DESC LIMIT ?",
+            String matchExclusion = excludedIds.isEmpty() ? "" : " AND m.id NOT IN ("
+                    + placeholders(excludedIds.size()) + ")";
+            List<UUID> matches = read(() -> jdbc.query("SELECT t.memory_id FROM chat_memory_terms t"
+                    + " JOIN chat_memory m ON m.user_id=t.user_id AND m.id=t.memory_id"
+                    + " WHERE t.user_id=? AND m.status='SUCCEEDED'"
+                    + " AND NOT EXISTS (SELECT 1 FROM chat_memory_quarantine q WHERE q.memory_id=m.id)"
+                    + " AND t.term_hash IN (" + placeholders(variants.size()) + ")"
+                    + (excludedRequestId == null ? "" : " AND m.client_request_id<>?") + matchExclusion
+                    + " GROUP BY t.memory_id ORDER BY SUM(CASE WHEN t.term_hash IN ("
+                    + placeholders(clues.size()) + ") THEN 1 ELSE 0 END) DESC,"
+                    + " MAX(m.finished_at) DESC,MAX(m.sequence_id) DESC LIMIT ?",
                     (rs, index) -> PortableJdbc.uuid(rs, 1), args.toArray()));
             if (!matches.isEmpty()) {
-                String ids = String.join(",", java.util.Collections.nCopies(matches.size(), "?"));
+                String ids = placeholders(matches.size());
                 List<Object> lookup = new ArrayList<>();
                 lookup.add(userId);
                 lookup.addAll(matches);
@@ -414,6 +429,35 @@ public class ChatMemoryService {
             if (!STOPWORDS.contains(word)) output.add(word);
         }
         return output;
+    }
+
+    private static String placeholders(int size) {
+        return String.join(",", java.util.Collections.nCopies(size, "?"));
+    }
+
+    /** Expand query terms only, so existing surface-form hashes also work for archived rows. */
+    private static Set<String> particleVariants(Set<String> clues) {
+        Set<String> variants = new LinkedHashSet<>(clues);
+        for (String word : clues) {
+            if (!HANGUL_WORD.matcher(word).matches()) continue;
+            String stem = word;
+            if (word.length() > 2) {
+                String prefix = word.substring(0, word.length() - 1);
+                if (particles(prefix).contains(word.substring(word.length() - 1))) stem = prefix;
+            }
+            if (STOPWORDS.contains(stem)) continue;
+            variants.add(stem);
+            if (stem.length() < 32) {
+                for (String particle : particles(stem)) variants.add(stem + particle);
+            }
+        }
+        return variants;
+    }
+
+    private static List<String> particles(String stem) {
+        // In modern Hangul syllables the final-consonant index is zero for a vowel ending.
+        return (stem.charAt(stem.length() - 1) - '가') % 28 == 0
+                ? VOWEL_PARTICLES : CONSONANT_PARTICLES;
     }
 
     private static String sha(byte[] bytes) {

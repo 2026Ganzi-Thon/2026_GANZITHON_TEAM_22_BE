@@ -11,6 +11,7 @@ public record TaskDto(
         String description,
         LocalDate dueDate,
         String status,
+        int version,
         Instant completedAt,
         Instant createdAt,
         Instant updatedAt,
@@ -28,6 +29,7 @@ public record TaskDto(
             String description,
             LocalDate dueDate,
             String status,
+            int version,
             Instant completedAt,
             Instant createdAt,
             Instant updatedAt,
@@ -39,7 +41,7 @@ public record TaskDto(
             SubtaskSummary summary = new SubtaskSummary(total, done,
                     total == 0 ? null : (double) done / total);
             return new Detail(task.id(), task.title(), task.description(), task.dueDate(),
-                    task.status(), task.completedAt(), task.createdAt(), task.updatedAt(),
+                    task.status(), task.version(), task.completedAt(), task.createdAt(), task.updatedAt(),
                     summary, List.copyOf(subtasks));
         }
     }

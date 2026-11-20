@@ -5,6 +5,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.atomic.AtomicInteger;
 import kr.ganzithon.backend.notification.PushSender;
@@ -160,6 +161,142 @@ class StudyAwayApiIntegrationTest {
         assertEquals(1,sender.calls.get());
     }
 
+    @Test void logoutDetachesOnlyItsInstallationAndAllowsAccountSwitch() throws Exception {
+        String email=UUID.randomUUID()+"@example.org";
+        String credentials=mapper.writeValueAsString(Map.of("email",email,"password","test-password-value"));
+        String owner=authorized(post("/api/v1/auth/register"),guest(),credentials,201).path("accessToken").asText();
+        String secondSession=authorized(post("/api/v1/auth/login"),null,credentials,200).path("accessToken").asText();
+        String otherAccount=guest();
+        String installation=UUID.randomUUID().toString();
+        String tokenBody=pushTokenBody();
+        String path="/api/v1/push-devices/"+installation;
+        authorized(put(path),owner,tokenBody,200);
+        String secondDevice=register(secondSession);
+        String study=study(owner);
+        String presencePath="/api/v1/study-sessions/"+study+"/presence";
+        presence(owner,presencePath,installation,UUID.randomUUID().toString(),1,"BACKGROUND",200);
+
+        authorized(delete(path),secondSession,null,204);
+        presence(secondSession,presencePath,installation,UUID.randomUUID().toString(),2,"FOREGROUND",404);
+        assertEquals("PUSH_DEVICE_SESSION_CONFLICT",authorized(put(path),secondSession,tokenBody,409).path("code").asText());
+        assertEquals("PUSH_DEVICE_SESSION_CONFLICT",authorized(put("/api/v1/push-devices/"+UUID.randomUUID()),
+                secondSession,tokenBody,409).path("code").asText());
+        assertEquals("PUSH_TOKEN_OWNERSHIP_CONFLICT",authorized(put("/api/v1/push-devices/"+UUID.randomUUID()),
+                otherAccount,tokenBody,409).path("code").asText());
+
+        authorized(post("/api/v1/auth/logout"),owner,"{}",400);
+        assertEquals(1L,deviceCount(installation));
+        authorized(post("/api/v1/auth/logout"),owner,null,204);
+        assertEquals(0L,deviceCount(installation));
+        assertEquals(1L,deviceCount(secondDevice));
+        authorized(get("/api/v1/me"),secondSession,null,200);
+        authorized(put(path),owner,tokenBody,401);
+        assertEquals(0L,jdbc.queryForObject("SELECT COUNT(*) FROM study_app_presence WHERE installation_id=?",
+                Long.class,installation).longValue());
+        authorized(put(path),otherAccount,tokenBody,200);
+        clock.advanceSeconds(300);
+        dispatcher.dispatch();
+        assertEquals(0,sender.calls.get());
+    }
+
+    @Test void legacyRegistrationSurvivesLogoutUntilMatchingOwnerBindsIt() throws Exception {
+        String email=UUID.randomUUID()+"@example.org";
+        String credentials=mapper.writeValueAsString(Map.of("email",email,"password","test-password-value"));
+        String owner=authorized(post("/api/v1/auth/register"),guest(),credentials,201).path("accessToken").asText();
+        String device=UUID.randomUUID().toString();
+        String tokenBody=pushTokenBody();
+        String path="/api/v1/push-devices/"+device;
+        authorized(put(path),owner,tokenBody,200);
+        String study=study(owner);
+        String presencePath="/api/v1/study-sessions/"+study+"/presence";
+        presence(owner,presencePath,device,UUID.randomUUID().toString(),1,"BACKGROUND",200);
+        jdbc.update("UPDATE push_devices SET auth_session_id=NULL WHERE installation_id=?",device);
+        authorized(delete(path),owner,null,204);
+        authorized(post("/api/v1/auth/logout"),owner,null,204);
+        assertEquals(1L,deviceCount(device));
+
+        String renewed=authorized(post("/api/v1/auth/login"),null,credentials,200).path("accessToken").asText();
+        assertEquals("PUSH_DEVICE_SESSION_CONFLICT",
+                authorized(put(path),renewed,pushTokenBody(),409).path("code").asText());
+        authorized(put(path),renewed,tokenBody,200);
+        assertEquals(0L,jdbc.queryForObject("SELECT COUNT(*) FROM study_app_presence WHERE installation_id=?",
+                Long.class,device).longValue());
+        authorized(post("/api/v1/auth/logout"),renewed,null,204);
+        assertEquals(0L,deviceCount(device));
+    }
+
+    @Test void unboundLegacyDeviceCannotSendOrSuppressAnotherDevicesReminder() throws Exception {
+        String owner=guest();
+        String study=study(owner);
+        String path="/api/v1/study-sessions/"+study+"/presence";
+        String legacy=register(owner);
+        presence(owner,path,legacy,UUID.randomUUID().toString(),1,"BACKGROUND",200);
+        jdbc.update("UPDATE push_devices SET auth_session_id=NULL WHERE installation_id=?",legacy);
+
+        clock.advanceSeconds(300);
+        dispatcher.dispatch();
+        assertEquals(0,sender.calls.get());
+        assertEquals(1L,deviceCount(legacy));
+
+        jdbc.update("UPDATE study_app_presence SET state='FOREGROUND' WHERE installation_id=?",legacy);
+        String current=register(owner);
+        presence(owner,path,current,UUID.randomUUID().toString(),1,"BACKGROUND",200);
+        clock.advanceSeconds(300);
+        dispatcher.dispatch();
+        assertEquals(1,sender.calls.get());
+    }
+
+    @Test void expiredBindingSuppressesDeliveryAndAllowsSameOwnerRecovery() throws Exception {
+        String email=UUID.randomUUID()+"@example.org";
+        String credentials=mapper.writeValueAsString(Map.of("email",email,"password","test-password-value"));
+        String owner=authorized(post("/api/v1/auth/register"),guest(),credentials,201).path("accessToken").asText();
+        String device=UUID.randomUUID().toString();
+        String tokenBody=pushTokenBody();
+        String path="/api/v1/push-devices/"+device;
+        authorized(put(path),owner,tokenBody,200);
+        String presencePath="/api/v1/study-sessions/"+study(owner)+"/presence";
+        presence(owner,presencePath,device,UUID.randomUUID().toString(),1,"BACKGROUND",200);
+        jdbc.update("UPDATE auth_sessions SET expires_at=? WHERE id=(SELECT auth_session_id FROM push_devices "
+                +"WHERE installation_id=?)",java.time.LocalDateTime.of(2026,11,3,0,0),device);
+        clock.advanceSeconds(300);
+        dispatcher.dispatch();
+        assertEquals(0,sender.calls.get());
+        authorized(put(path),guest(),tokenBody,409);
+        String renewed=authorized(post("/api/v1/auth/login"),null,credentials,200).path("accessToken").asText();
+        authorized(put(path),renewed,pushTokenBody(),409);
+        authorized(put(path),renewed,tokenBody,200);
+        presence(renewed,presencePath,device,UUID.randomUUID().toString(),1,"BACKGROUND",200);
+        authorized(post("/api/v1/auth/logout"),renewed,null,204);
+        assertEquals(0L,deviceCount(device));
+    }
+
+    @Test void guestConversionAndPasswordChangeKeepOnlyTheCurrentBinding() throws Exception {
+        String email=UUID.randomUUID()+"@example.org";
+        String credentials=mapper.writeValueAsString(Map.of("email",email,"password","test-password-value"));
+        String guest=guest();
+        String device=register(guest);
+        String owner=authorized(post("/api/v1/auth/register"),guest,credentials,201).path("accessToken").asText();
+        authorized(get("/api/v1/me"),guest,null,401);
+        String secondSession=authorized(post("/api/v1/auth/login"),null,credentials,200).path("accessToken").asText();
+        String secondDevice=register(secondSession);
+        String change=mapper.writeValueAsString(Map.of("currentPassword","test-password-value",
+                "newPassword","replacement-password-value"));
+        String renewed=authorized(post("/api/v1/auth/password"),owner,change,200).path("accessToken").asText();
+        authorized(get("/api/v1/me"),secondSession,null,401);
+        assertEquals(1L,deviceCount(device));
+        assertEquals(0L,deviceCount(secondDevice));
+        authorized(post("/api/v1/auth/logout"),renewed,null,204);
+        assertEquals(0L,deviceCount(device));
+    }
+
+    private long deviceCount(String installation) {
+        return jdbc.queryForObject("SELECT COUNT(*) FROM push_devices WHERE installation_id=?",Long.class,installation);
+    }
+
+    private String pushTokenBody() {
+        return "{\"expoPushToken\":\"ExpoPushToken["+UUID.randomUUID().toString().replace("-","")+"]\"}";
+    }
+
     private String guest() throws Exception {
         JsonNode issued = authorized(post("/api/v1/guest-sessions"),null,null,201);
         owners.add(UUID.fromString(issued.path("userId").asText()));
@@ -172,7 +309,7 @@ class StudyAwayApiIntegrationTest {
     private String register(String token) throws Exception {
         String device=UUID.randomUUID().toString();
         authorized(put("/api/v1/push-devices/"+device),token,
-                "{\"expoPushToken\":\"ExpoPushToken["+UUID.randomUUID().toString().replace("-","")+ "]\"}",200);
+                pushTokenBody(),200);
         return device;
     }
     private JsonNode presence(String token,String path,String device,String event,long seq,String state,int expected)

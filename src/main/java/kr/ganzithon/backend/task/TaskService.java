@@ -10,6 +10,7 @@ import java.time.OffsetDateTime;
 import java.time.ZoneOffset;
 import java.time.format.DateTimeParseException;
 import java.util.List;
+import java.util.Objects;
 import java.util.Set;
 import java.util.UUID;
 import kr.ganzithon.backend.common.ApiException;
@@ -20,8 +21,9 @@ import org.springframework.transaction.annotation.Transactional;
 
 @Service
 public class TaskService {
-    private static final Set<String> CREATE_FIELDS = Set.of("title", "description", "dueDate");
-    private static final Set<String> PATCH_FIELDS = Set.of("title", "description", "dueDate", "status");
+    private static final Set<String> CREATE_FIELDS = Set.of("title", "description", "dueDate", "clientRequestId");
+    private static final Set<String> PATCH_FIELDS =
+            Set.of("title", "description", "dueDate", "status", "expectedVersion");
     private static final String TASK_SELECT = """
             SELECT t.*,
                    (SELECT COUNT(*) FROM subtasks s WHERE s.task_id = t.id) AS subtask_total,
@@ -30,19 +32,38 @@ public class TaskService {
             """;
     private final PortableJdbc jdbc;
     private final Clock clock;
+    private final TaskCreateRequests createRequests;
 
-    public TaskService(JdbcTemplate jdbc, Clock clock) {
+    public TaskService(JdbcTemplate jdbc, Clock clock, TaskCreateRequests createRequests) {
         this.jdbc = new PortableJdbc(jdbc);
         this.clock = clock;
+        this.createRequests = createRequests;
     }
 
     @Transactional
     public TaskDto create(UUID userId, JsonNode body) {
+        return createResult(userId, body).value();
+    }
+
+    @Transactional
+    public TaskCreateRequests.Result<TaskDto> createResult(UUID userId, JsonNode body) {
         checkFields(body, CREATE_FIELDS, false);
         String title = title(body.get("title"));
         String description = nullableDescription(body.get("description"));
         LocalDate dueDate = nullableDate(body.get("dueDate"));
+        UUID requestId = TaskCreateRequests.requestId(body);
+        String hash = TaskCreateRequests.hash("TASK", null, title, description,
+                dueDate == null ? null : dueDate.toString());
         lockUser(userId);
+        UUID savedId = createRequests.prior(userId, requestId, "TASK", null, hash);
+        if (savedId != null) {
+            try {
+                return new TaskCreateRequests.Result<>(findOwned(userId, savedId), false);
+            } catch (ApiException ex) {
+                if (ex.status() == 404) throw TaskCreateRequests.deleted();
+                throw ex;
+            }
+        }
         UUID id = UUID.randomUUID();
         OffsetDateTime now = now();
         jdbc.update("""
@@ -50,7 +71,8 @@ public class TaskService {
                                    completed_at, created_at, updated_at)
                 VALUES (?, ?, ?, ?, ?, 'TODO', NULL, ?, ?)
                 """, id, userId, title, description, dueDate, now, now);
-        return findOwned(userId, id);
+        createRequests.record(userId, requestId, "TASK", null, id, hash, now);
+        return new TaskCreateRequests.Result<>(findOwned(userId, id), true);
     }
 
     @Transactional(readOnly = true)
@@ -78,6 +100,18 @@ public class TaskService {
     @Transactional
     public TaskDto patch(UUID userId, UUID taskId, JsonNode body) {
         checkFields(body, PATCH_FIELDS, true);
+        if (body.size() == 1 && body.has("expectedVersion")) {
+            throw badRequest("Include at least one task field to update");
+        }
+        Integer expectedVersion = null;
+        if (body.has("expectedVersion")) {
+            JsonNode versionNode = body.get("expectedVersion");
+            if (!versionNode.isIntegralNumber() || !versionNode.canConvertToInt()
+                    || versionNode.intValue() < 0) {
+                throw badRequest("expectedVersion must be a nonnegative integer");
+            }
+            expectedVersion = versionNode.intValue();
+        }
         String newTitle = body.has("title") ? title(body.get("title")) : null;
         String newDescription = body.has("description") ? nullableDescription(body.get("description")) : null;
         LocalDate newDueDate = body.has("dueDate") ? nullableDate(body.get("dueDate")) : null;
@@ -85,6 +119,10 @@ public class TaskService {
 
         lockUser(userId);
         TaskDto current = findOwned(userId, taskId);
+        if (expectedVersion != null && expectedVersion != current.version()) {
+            throw new ApiException(409, "TASK_VERSION_CONFLICT",
+                    "Task changed since it was opened");
+        }
         String title = body.has("title") ? newTitle : current.title();
         String description = body.has("description") ? newDescription : current.description();
         LocalDate dueDate = body.has("dueDate") ? newDueDate : current.dueDate();
@@ -94,11 +132,19 @@ public class TaskService {
         if (!taskStatus.equals(current.status())) {
             completedAt = "DONE".equals(taskStatus) ? now() : null;
         }
+        boolean changed = !title.equals(current.title())
+                || !Objects.equals(description, current.description())
+                || !Objects.equals(dueDate, current.dueDate())
+                || !taskStatus.equals(current.status());
+        if (!changed) {
+            return current;
+        }
         jdbc.update("""
                 UPDATE tasks SET title = ?, description = ?, due_date = ?, status = ?,
-                                 completed_at = ?, updated_at = ?
+                                 completed_at = ?, version = ?, updated_at = ?
                 WHERE id = ? AND user_id = ?
-                """, title, description, dueDate, taskStatus, completedAt, now(), taskId, userId);
+                """, title, description, dueDate, taskStatus, completedAt,
+                current.version() + 1, now(), taskId, userId);
         return findOwned(userId, taskId);
     }
 
@@ -140,7 +186,7 @@ public class TaskService {
         return new TaskDto(
                 PortableJdbc.uuid(rs, "id"), rs.getString("title"), rs.getString("description"),
                 rs.getDate("due_date") == null ? null : rs.getDate("due_date").toLocalDate(),
-                rs.getString("status"), instant(rs, "completed_at"), instant(rs, "created_at"),
+                rs.getString("status"), rs.getInt("version"), instant(rs, "completed_at"), instant(rs, "created_at"),
                 instant(rs, "updated_at"),
                 new TaskDto.SubtaskSummary(total, done, total == 0 ? null : (double) done / total));
     }

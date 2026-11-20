@@ -183,22 +183,44 @@ class ChatMemoryIntegrationTest {
     }
 
     @Test
-    void olderThanEightTurnsAreRetrievedByExactKoreanTermButParticleVariationIsNot() {
+    void archivedKoreanTermsAreRetrievedWithExactAndDifferentParticles() {
         UUID owner = user();
-        Instant base = Instant.now().minus(10, ChronoUnit.DAYS);
+        UUID other = user();
+        Instant base = Instant.now().minus(61, ChronoUnit.DAYS);
         ChatDto.Request exact = request("기하학 증명 목표", null);
         memory.save(owner, exact, exchange(exact, base, "SUCCEEDED"), "9".repeat(64));
         ChatDto.Request inflected = request("토익은 850점이 목표야", null);
         memory.save(owner, inflected, exchange(inflected, base.plusSeconds(1), "SUCCEEDED"), "a".repeat(64));
+        ChatDto.Request fruit = request("사과를 좋아해", null);
+        memory.save(owner, fruit, exchange(fruit, base.plusSeconds(2), "SUCCEEDED"), "a".repeat(64));
+        ChatDto.Request snack = request("과자를 샀어", null);
+        memory.save(owner, snack, exchange(snack, base.plusSeconds(3), "SUCCEEDED"), "a".repeat(64));
+        ChatDto.Request animal = request("새끼손가락 마디", null);
+        memory.save(owner, animal, exchange(animal, base.plusSeconds(4), "SUCCEEDED"), "a".repeat(64));
+        ChatDto.Request privateRecord = request("토익이 다른계정비밀", null);
+        memory.save(other, privateRecord, exchange(privateRecord, base.plusSeconds(5), "SUCCEEDED"), "a".repeat(64));
+        ChatDto.Request exactFruit = request("사과는 품종이 다양해", null);
+        memory.save(owner, exactFruit, exchange(exactFruit, base, "SUCCEEDED"), "a".repeat(64));
+        ChatDto.Request newerFruit = request("사과가 빨갛다", null);
+        memory.save(owner, newerFruit, exchange(newerFruit, base.plusSeconds(6), "SUCCEEDED"), "a".repeat(64));
         for (int i = 0; i < 9; i++) {
             ChatDto.Request newer = request("최근 대화 " + i, null);
-            memory.save(owner, newer, exchange(newer, base.plusSeconds(i + 2), "SUCCEEDED"),
+            memory.save(owner, newer, exchange(newer, Instant.now().minus(1, ChronoUnit.DAYS).plusSeconds(i), "SUCCEEDED"),
                     Integer.toHexString(i).repeat(64).substring(0, 64));
         }
+        assertEquals(8, memory.archiveOld(100));
         String exactContext = memory.context(owner, "기하학 증명 기억해?", null);
         assertTrue(exactContext.contains("기하학 증명 목표"));
-        String inflectedContext = memory.context(owner, "토익 목표 기억나?", null);
-        assertFalse(inflectedContext.contains("850점이"));
+        assertTrue(memory.context(owner, "토익", null).contains("850점이"));
+        String inflectedContext = memory.context(owner, "토익이", null);
+        assertTrue(inflectedContext.contains("850점이"));
+        assertFalse(inflectedContext.contains("다른계정비밀"));
+        String fruitContext = memory.context(owner, "사과는", null);
+        assertTrue(fruitContext.contains("사과는 품종이 다양해"));
+        assertTrue(fruitContext.contains("사과가 빨갛다"));
+        assertFalse(fruitContext.contains("사과를 좋아해"));
+        assertFalse(fruitContext.contains("과자를 샀어"));
+        assertFalse(memory.context(owner, "새끼가", null).contains("새끼손가락"));
     }
 
     @Test

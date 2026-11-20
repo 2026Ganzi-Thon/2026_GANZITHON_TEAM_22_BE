@@ -430,6 +430,36 @@ class OpenAiChatProviderTest {
     }
 
     @Test
+    void refusedLoopbackConnectionIsNonChargeable() throws Exception {
+        HttpServer server = server();
+        server.start();
+        OpenAiChatProvider provider = provider(server, 5);
+        server.stop(0);
+        ChatProviderException failure = assertThrows(ChatProviderException.class,
+                () -> provider.generate("hello", null, null, keys));
+        assertEquals("AI_PROVIDER_FAILED", failure.code());
+        assertFalse(failure.chargeableUnknown());
+        assertNull(failure.usage());
+    }
+
+    @Test
+    void lostResponseAfterReadingPostRemainsChargeableUnknown() throws Exception {
+        HttpServer server = server();
+        AtomicInteger received = new AtomicInteger();
+        server.createContext("/v1/responses", exchange -> {
+            if (exchange.getRequestBody().readAllBytes().length > 0) received.incrementAndGet();
+            exchange.close();
+        });
+        server.start();
+        try {
+            ChatProviderException failure = assertThrows(ChatProviderException.class,
+                    () -> provider(server, 5).generate("hello", null, null, keys));
+            assertTrue(received.get() > 0);
+            assertTrue(failure.chargeableUnknown());
+        } finally { server.stop(0); }
+    }
+
+    @Test
     void legacyHomeDefaultAndInvalidServerState() throws Exception {
         HttpServer server = server();
         try {

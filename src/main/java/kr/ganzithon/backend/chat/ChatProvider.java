@@ -6,6 +6,9 @@ import java.util.List;
 public interface ChatProvider {
     default void ensureConfigured() { }
 
+    /** Optional lower bound for all reservations by this provider. */
+    default CostQuote minimumReservationQuote() { return null; }
+
     /** Only providers that serialize sessionTranscript should opt in. */
     default boolean usesSessionTranscript() { return false; }
 

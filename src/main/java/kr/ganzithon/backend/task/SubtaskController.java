@@ -25,7 +25,8 @@ public class SubtaskController {
     @PostMapping
     public ResponseEntity<SubtaskDto> create(@RequestAttribute("userId") UUID userId,
                                              @PathVariable UUID taskId, @RequestBody JsonNode body) {
-        return ResponseEntity.status(HttpStatus.CREATED).body(service.create(userId, taskId, body));
+        var result = service.createResult(userId, taskId, body);
+        return ResponseEntity.status(result.created() ? HttpStatus.CREATED : HttpStatus.OK).body(result.value());
     }
 
     @PatchMapping("/{subtaskId}")

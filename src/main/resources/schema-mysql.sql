@@ -41,14 +41,16 @@ CREATE TABLE IF NOT EXISTS tasks (
  completed_at DATETIME(6) NULL,
  created_at DATETIME(6) NOT NULL,
  updated_at DATETIME(6) NOT NULL,
+ version INT NOT NULL DEFAULT 0,
  PRIMARY KEY (id),
  UNIQUE KEY uq_tasks_id_user (id,user_id),
  KEY idx_tasks_user_status_due_id (user_id,status,due_date,id),
  CONSTRAINT fk_tasks_user FOREIGN KEY (user_id) REFERENCES users(id),
- CONSTRAINT chk_tasks_status CHECK (status IN ('TODO','DONE')),
+ CONSTRAINT chk_tasks_status CHECK (status IN (_ascii'TODO',_ascii'DONE')),
+ CONSTRAINT chk_tasks_version CHECK (version >= 0),
  CONSTRAINT chk_tasks_completed CHECK (
-  (status='TODO' AND completed_at IS NULL) OR
-  (status='DONE' AND completed_at IS NOT NULL)
+  (status=_ascii'TODO' AND completed_at IS NULL) OR
+  (status=_ascii'DONE' AND completed_at IS NOT NULL)
  )
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
 
@@ -71,6 +73,20 @@ CREATE TABLE IF NOT EXISTS subtasks (
   (status='TODO' AND completed_at IS NULL) OR
   (status='DONE' AND completed_at IS NOT NULL)
  )
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
+
+-- Keep create-result tombstones after a task or subtask is deleted so a retry cannot revive it.
+CREATE TABLE IF NOT EXISTS task_create_requests (
+ user_id CHAR(36) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+ request_id CHAR(36) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+ resource_type VARCHAR(16) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+ parent_task_id CHAR(36) CHARACTER SET ascii COLLATE ascii_bin NULL,
+ resource_id CHAR(36) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+ request_hash CHAR(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+ created_at DATETIME(6) NOT NULL,
+ PRIMARY KEY (user_id,request_id),
+ CONSTRAINT fk_task_create_requests_user FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+ CONSTRAINT chk_task_create_requests_type CHECK (resource_type IN ('TASK','SUBTASK'))
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
 
 CREATE TABLE IF NOT EXISTS study_sessions (
@@ -265,11 +281,15 @@ CREATE TABLE IF NOT EXISTS push_devices (
  token_hash CHAR(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
  created_at DATETIME(6) NOT NULL,
  updated_at DATETIME(6) NOT NULL,
+ auth_session_id CHAR(36) CHARACTER SET ascii COLLATE ascii_bin NULL,
  PRIMARY KEY (installation_id),
  UNIQUE KEY uq_push_devices_install_owner (installation_id,user_id),
  UNIQUE KEY uq_push_devices_token_hash (token_hash),
+ UNIQUE KEY uq_push_devices_auth_session (auth_session_id),
  KEY idx_push_devices_user (user_id),
- CONSTRAINT fk_push_devices_user FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+ CONSTRAINT fk_push_devices_user FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+ CONSTRAINT fk_push_devices_auth_session FOREIGN KEY (auth_session_id)
+  REFERENCES auth_sessions(id) ON DELETE SET NULL
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
 
 -- One durable departure/outbox per session and app installation.
