@@ -1,5 +1,7 @@
 # 해보양 EC2 배포
 
+시드니 팀 QA의 검증된 JAR, API 컨테이너 교체 방법, 실제 대화·로그인 결과는 [제출용 QA 배포 기록](sydney-qa-release.md)에서 확인할 수 있습니다.
+
 EC2에서 Caddy와 Spring Boot 컨테이너를 실행합니다. 웹과 앱은 같은 HTTPS API를 사용하고, API는 같은 VPC의 비공개 RDS MySQL에 연결합니다. 시작 시 Flyway가 DB 마이그레이션을 적용합니다.
 
 ## 첫 배포 준비
